@@ -1,0 +1,22 @@
+[package]
+name = "geeq"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+image = "0.25"
+kamadak-exif = "0.5"
+rfd = "0.15"
+turbojpeg = { version = "1", features = ["image"] }
+
+[profile.release]
+opt-level = 3
+
+# Image decoding (and egui/winit) are unusably slow in a plain debug build -
+# the codecs are CPU-bound pixel loops that need optimization to be fast.
+# Keep our own crate's debug info/fast-recompile, but optimize dependencies
+# even under `cargo run` (no --release needed) so `cargo run` stays fast.
+[profile.dev.package."*"]
+opt-level = 3
