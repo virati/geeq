@@ -52,6 +52,21 @@ fn save_dir_activity(map: &HashMap<PathBuf, u32>) {
     let _ = fs::write(path, content);
 }
 
+/// The longest shared path prefix of two directories, e.g. `/a/b/c` and
+/// `/a/b/d` share `/a/b`. Used to fold clusters of active directories up
+/// into a single representative "favorite" folder.
+fn common_ancestor_path(a: &Path, b: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for (ca, cb) in a.components().zip(b.components()) {
+        if ca == cb {
+            result.push(ca.as_os_str());
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 /// The classic exposure triangle for one photo, pulled straight from EXIF
 /// without decoding the image. Used to plot how exposure settings were used
 /// across a whole folder.
@@ -336,6 +351,59 @@ impl GeeqApp {
     fn record_activity(&mut self) {
         *self.dir_activity.entry(self.current_dir.clone()).or_insert(0) += 1;
         save_dir_activity(&self.dir_activity);
+    }
+
+    /// Collapses the most-active directories down to a handful of "favorite"
+    /// parent folders: each favorite is the closest common ancestor of a
+    /// cluster of frequently-visited directories, so one click lands as
+    /// close as possible to wherever activity is concentrated, rather than
+    /// listing every visited leaf folder individually.
+    fn compute_favorites(&self) -> Vec<(PathBuf, u32, usize)> {
+        const MAX_SOURCE_DIRS: usize = 20;
+        const TARGET_COUNT: usize = 8;
+        const MAX_CLIMB: usize = 2;
+
+        let mut clusters: Vec<(PathBuf, u32, usize)> = self
+            .dir_activity
+            .iter()
+            .map(|(p, &w)| (p.clone(), w, 1usize))
+            .collect();
+        clusters.sort_by(|a, b| b.1.cmp(&a.1));
+        clusters.truncate(MAX_SOURCE_DIRS);
+
+        while clusters.len() > TARGET_COUNT {
+            let mut best: Option<(usize, usize, PathBuf, usize)> = None;
+            for i in 0..clusters.len() {
+                for j in (i + 1)..clusters.len() {
+                    let a = &clusters[i].0;
+                    let b = &clusters[j].0;
+                    let ancestor = common_ancestor_path(a, b);
+                    let depth = ancestor.components().count();
+                    if depth == 0 {
+                        continue;
+                    }
+                    let min_depth = a.components().count().min(b.components().count());
+                    if min_depth.saturating_sub(depth) > MAX_CLIMB {
+                        continue;
+                    }
+                    if best.as_ref().map(|(_, _, _, d)| depth > *d).unwrap_or(true) {
+                        best = Some((i, j, ancestor, depth));
+                    }
+                }
+            }
+            match best {
+                Some((i, j, ancestor, _)) => {
+                    let (_, wj, cj) = clusters.remove(j);
+                    let (_, wi, ci) = clusters.remove(i);
+                    clusters.push((ancestor, wi + wj, ci + cj));
+                }
+                None => break,
+            }
+        }
+
+        clusters.sort_by(|a, b| b.1.cmp(&a.1));
+        clusters.truncate(TARGET_COUNT);
+        clusters
     }
 
     fn is_hidden(path: &Path) -> bool {
@@ -935,7 +1003,37 @@ impl eframe::App for GeeqApp {
                     }
                 });
 
-                let path_edit = ui.text_edit_singleline(&mut self.path_input);
+                egui::CollapsingHeader::new("⭐ Favorites")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let favorites = self.compute_favorites();
+                        if favorites.is_empty() {
+                            ui.label("No activity recorded yet.");
+                        } else {
+                            let mut jump_to = None;
+                            for (dir, weight, merged) in &favorites {
+                                let label = if *merged > 1 {
+                                    format!("{}  ({weight}, {merged} folders)", dir.display())
+                                } else {
+                                    format!("{}  ({weight})", dir.display())
+                                };
+                                let is_current = *dir == self.current_dir;
+                                if ui.selectable_label(is_current, label).clicked() {
+                                    jump_to = Some(dir.clone());
+                                }
+                            }
+                            if let Some(dir) = jump_to {
+                                self.navigate_to(dir);
+                            }
+                        }
+                    });
+
+                ui.separator();
+
+                let path_edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.path_input)
+                        .desired_width(ui.available_width()),
+                );
                 if path_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let candidate = PathBuf::from(&self.path_input);
                     if candidate.is_dir() {
@@ -956,11 +1054,11 @@ impl eframe::App for GeeqApp {
                         ui.with_layout(
                             egui::Layout::top_down_justified(egui::Align::LEFT),
                             |ui| {
-                                if ui.selectable_label(false, "📁 .").double_clicked() {
+                                if ui.selectable_label(false, "📁 .").clicked() {
                                     self.rescan_dir();
                                 }
                                 if let Some(parent) = self.current_dir.parent() {
-                                    if ui.selectable_label(false, "📁 ..").double_clicked() {
+                                    if ui.selectable_label(false, "📁 ..").clicked() {
                                         self.navigate_to(parent.to_path_buf());
                                     }
                                 }
@@ -971,7 +1069,7 @@ impl eframe::App for GeeqApp {
                                         .unwrap_or_default();
                                     if ui
                                         .selectable_label(false, format!("📁 {name}"))
-                                        .double_clicked()
+                                        .clicked()
                                     {
                                         self.navigate_to(dir);
                                     }
