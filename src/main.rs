@@ -7,16 +7,27 @@ use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 
-/// Where the per-directory activity weights are persisted between runs.
-fn recent_dirs_file() -> Option<PathBuf> {
+mod looks;
+
+fn config_file(name: &str) -> Option<PathBuf> {
     let config_home = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
         .ok()?;
-    Some(config_home.join("geeq").join("recent_dirs.txt"))
+    Some(config_home.join("geeq").join(name))
+}
+
+/// Where the per-directory activity weights are persisted between runs.
+fn recent_dirs_file() -> Option<PathBuf> {
+    config_file("recent_dirs.txt")
+}
+
+/// Remembers which snaplite looks file was last loaded.
+fn looks_path_file() -> Option<PathBuf> {
+    config_file("looks_path.txt")
 }
 
 fn load_dir_activity() -> HashMap<PathBuf, u32> {
@@ -238,11 +249,34 @@ struct LoadedImage {
     size: egui::Vec2,
     exif: Option<ExifInfo>,
     histogram: Option<Histogram>,
+    /// The decoded pixels before any looks, kept so the filter stack can be
+    /// re-applied on the fly without re-reading the file.
+    original: Option<Arc<image::RgbaImage>>,
+    /// Animated GIFs: every decoded frame (with its delay in seconds), and
+    /// the same frames rendered through the filter stack for playback.
+    anim_src: Option<Arc<Vec<(image::RgbaImage, f64)>>>,
+    anim: Option<Anim>,
 }
 
+struct Anim {
+    frames: Vec<(Arc<ColorImage>, f64)>,
+    index: usize,
+    next_at: f64,
+    paused: bool,
+}
+
+/// Decoded frames above this many bytes of RGBA are dropped, so a huge GIF
+/// plays truncated instead of exhausting memory.
+const ANIM_BYTE_BUDGET: usize = 512 << 20;
+
+/// Texture/Histogram/Original carry the filter revision they were rendered
+/// for; results from a superseded filter stack are dropped.
 enum LoadMsg {
-    Texture(u64, PathBuf, ColorImage),
-    Histogram(u64, PathBuf, Histogram),
+    Texture(u64, u64, PathBuf, ColorImage),
+    Histogram(u64, u64, PathBuf, Histogram),
+    Original(u64, u64, PathBuf, Arc<image::RgbaImage>),
+    AnimSource(u64, u64, PathBuf, Arc<Vec<(image::RgbaImage, f64)>>),
+    Frames(u64, u64, PathBuf, Vec<(ColorImage, f64)>),
     Exif(u64, PathBuf, ExifInfo),
     Error(u64, String),
 }
@@ -272,6 +306,31 @@ struct GeeqApp {
     /// touch the file on disk.
     rotation: u8,
     clip_stack: Vec<PathBuf>,
+    /// Looks exported from snaplite, and the live filter mode that applies
+    /// them to whatever image is shown.
+    looks_lib: Vec<looks::Look>,
+    looks_path: Option<PathBuf>,
+    looks_error: Option<String>,
+    filter_mode: bool,
+    /// Indices into `looks_lib`, in the order they were switched on; looks
+    /// are applied in this order, each to the previous one's output.
+    active_looks: Vec<usize>,
+    /// Fullscreen slideshow ("screensaver") mode: cycles through the folder
+    /// with whatever filters are currently selected.
+    slideshow: bool,
+    slideshow_interval: f32,
+    slideshow_shuffle: bool,
+    slideshow_next_at: f64,
+    slideshow_shown: Option<PathBuf>,
+    slideshow_shown_at: f64,
+    /// The previous image, drawn until the next one has decoded so the
+    /// screen doesn't flash black between slides.
+    slideshow_hold: Option<(TextureHandle, egui::Vec2)>,
+    rng_state: u64,
+    /// Bumped whenever the filter stack changes.
+    filter_rev: u64,
+    /// A re-filter is running in the background.
+    filtering: bool,
     generation: u64,
     load_tx: mpsc::Sender<LoadMsg>,
     load_rx: mpsc::Receiver<LoadMsg>,
@@ -298,10 +357,18 @@ struct GeeqApp {
 }
 
 impl GeeqApp {
-    fn new() -> Self {
-        let start_dir = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    fn new(start_path: Option<PathBuf>) -> Self {
+        let start_dir = start_path
+            .and_then(|p| {
+                let p = fs::canonicalize(&p).unwrap_or(p);
+                if p.is_dir() {
+                    Some(p)
+                } else {
+                    p.parent().map(PathBuf::from)
+                }
+            })
+            .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         let (load_tx, load_rx) = mpsc::channel();
         let (exposure_tx, exposure_rx) = mpsc::channel();
@@ -325,6 +392,21 @@ impl GeeqApp {
             zoom: 1.0,
             rotation: 0,
             clip_stack: Vec::new(),
+            looks_lib: Vec::new(),
+            looks_path: None,
+            looks_error: None,
+            filter_mode: false,
+            active_looks: Vec::new(),
+            slideshow: false,
+            slideshow_interval: 7.0,
+            slideshow_shuffle: false,
+            slideshow_next_at: f64::INFINITY,
+            slideshow_shown: None,
+            slideshow_shown_at: 0.0,
+            slideshow_hold: None,
+            rng_state: 0x2545_F491_4F6C_DD1D,
+            filter_rev: 0,
+            filtering: false,
             generation: 0,
             load_tx,
             load_rx,
@@ -341,6 +423,12 @@ impl GeeqApp {
             thumb_tx,
             thumb_rx,
         };
+        if let Some(path) = looks_path_file()
+            .and_then(|f| fs::read_to_string(f).ok())
+            .map(|t| PathBuf::from(t.trim()))
+        {
+            app.load_looks_file(path, false);
+        }
         app.refresh_dir();
         app
     }
@@ -592,20 +680,40 @@ impl GeeqApp {
             size: egui::Vec2::ZERO,
             exif: None,
             histogram: None,
+            original: None,
+            anim_src: None,
+            anim: None,
         });
+        self.filtering = false;
 
         let decode_tx = self.load_tx.clone();
         let decode_path = path.clone();
-        thread::spawn(move || match decode_to_rgba(&decode_path) {
-            Ok(rgba) => {
-                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-                let color_image = ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
-                let _ = decode_tx.send(LoadMsg::Texture(gen, decode_path.clone(), color_image));
-                let histogram = Histogram::from_rgba(rgba.as_raw());
-                let _ = decode_tx.send(LoadMsg::Histogram(gen, decode_path, histogram));
-            }
-            Err(err) => {
-                let _ = decode_tx.send(LoadMsg::Error(gen, format!("Failed to open image: {err}")));
+        let rev = self.filter_rev;
+        let active = self.active_look_list();
+        thread::spawn(move || {
+            // Animated GIFs decode every frame; a single-frame GIF (or one
+            // that fails here) takes the ordinary still-image path.
+            let frames = decode_gif_frames(&decode_path).filter(|f| f.len() > 1);
+            let decoded = match &frames {
+                Some(f) => Ok(Arc::new(f[0].0.clone())),
+                None => decode_to_rgba(&decode_path).map(Arc::new),
+            };
+            match decoded {
+                Ok(rgba) => {
+                    let _ = decode_tx.send(LoadMsg::Original(gen, rev, decode_path.clone(), rgba.clone()));
+                    let (color_image, histogram) = render_filtered(&rgba, &active);
+                    let _ = decode_tx.send(LoadMsg::Texture(gen, rev, decode_path.clone(), color_image));
+                    let _ = decode_tx.send(LoadMsg::Histogram(gen, rev, decode_path.clone(), histogram));
+                    if let Some(frames) = frames {
+                        let frames = Arc::new(frames);
+                        let rendered = render_frames(&frames, &active);
+                        let _ = decode_tx.send(LoadMsg::AnimSource(gen, rev, decode_path.clone(), frames));
+                        let _ = decode_tx.send(LoadMsg::Frames(gen, rev, decode_path, rendered));
+                    }
+                }
+                Err(err) => {
+                    let _ = decode_tx.send(LoadMsg::Error(gen, format!("Failed to open image: {err}")));
+                }
             }
         });
 
@@ -621,10 +729,57 @@ impl GeeqApp {
     fn drain_load_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.load_rx.try_recv() {
             match msg {
-                LoadMsg::Texture(gen, path, color_image) => {
+                LoadMsg::Original(gen, rev, path, original) => {
                     if gen != self.generation {
                         continue;
                     }
+                    if let Some(loaded) = &mut self.loaded {
+                        if loaded.path == path {
+                            loaded.original = Some(original);
+                            // The stack changed while this was decoding.
+                            if rev != self.filter_rev {
+                                self.refilter();
+                            }
+                        }
+                    }
+                }
+                LoadMsg::AnimSource(gen, rev, path, frames) => {
+                    if gen != self.generation {
+                        continue;
+                    }
+                    if let Some(loaded) = &mut self.loaded {
+                        if loaded.path == path {
+                            loaded.anim_src = Some(frames);
+                            if rev != self.filter_rev {
+                                self.refilter();
+                            }
+                        }
+                    }
+                }
+                LoadMsg::Frames(gen, rev, path, frames) => {
+                    if gen != self.generation || rev != self.filter_rev {
+                        continue;
+                    }
+                    let now = ctx.input(|i| i.time);
+                    if let Some(loaded) = &mut self.loaded {
+                        if loaded.path == path {
+                            let (index, paused) = loaded
+                                .anim
+                                .as_ref()
+                                .map_or((0, false), |a| (a.index, a.paused));
+                            let frames: Vec<_> =
+                                frames.into_iter().map(|(img, d)| (Arc::new(img), d)).collect();
+                            let index = index % frames.len().max(1);
+                            let delay = frames.get(index).map_or(0.1, |f| f.1);
+                            loaded.anim = Some(Anim { frames, index, next_at: now + delay, paused });
+                        }
+                    }
+                }
+                LoadMsg::Texture(gen, rev, path, color_image) => {
+                    if gen != self.generation || rev != self.filter_rev {
+                        continue;
+                    }
+                    self.filtering = false;
                     if let Some(loaded) = &mut self.loaded {
                         if loaded.path == path {
                             loaded.size = egui::vec2(
@@ -639,8 +794,8 @@ impl GeeqApp {
                         }
                     }
                 }
-                LoadMsg::Histogram(gen, path, histogram) => {
-                    if gen != self.generation {
+                LoadMsg::Histogram(gen, rev, path, histogram) => {
+                    if gen != self.generation || rev != self.filter_rev {
                         continue;
                     }
                     if let Some(loaded) = &mut self.loaded {
@@ -676,7 +831,7 @@ impl GeeqApp {
             .as_ref()
             .map(|l| l.texture.is_none() || l.histogram.is_none() || l.exif.is_none())
             .unwrap_or(false);
-        if pending {
+        if pending || self.filtering {
             ctx.request_repaint();
         }
 
@@ -699,6 +854,212 @@ impl GeeqApp {
             );
             self.thumbnail_cache.insert(path.clone(), texture);
             self.thumbnail_pending.remove(&path);
+        }
+    }
+
+    /// The looks to apply to the displayed image, in stack order. Empty when
+    /// filter mode is off.
+    fn active_look_list(&self) -> Vec<looks::Look> {
+        if !self.filter_mode {
+            return Vec::new();
+        }
+        self.active_looks
+            .iter()
+            .filter_map(|&i| self.looks_lib.get(i).cloned())
+            .collect()
+    }
+
+    /// Re-renders the current image through the filter stack in the
+    /// background; the texture is swapped when it's ready.
+    fn refilter(&mut self) {
+        self.filter_rev += 1;
+        let Some(loaded) = &self.loaded else { return };
+        // Still decoding: its Original message will notice the new revision.
+        let Some(original) = loaded.original.clone() else { return };
+        let (gen, rev, path) = (self.generation, self.filter_rev, loaded.path.clone());
+        let active = self.active_look_list();
+        let tx = self.load_tx.clone();
+        self.filtering = true;
+        let anim_src = loaded.anim_src.clone();
+        thread::spawn(move || {
+            let (color_image, histogram) = render_filtered(&original, &active);
+            let _ = tx.send(LoadMsg::Texture(gen, rev, path.clone(), color_image));
+            let _ = tx.send(LoadMsg::Histogram(gen, rev, path.clone(), histogram));
+            if let Some(src) = anim_src {
+                let _ = tx.send(LoadMsg::Frames(gen, rev, path, render_frames(&src, &active)));
+            }
+        });
+    }
+
+    /// Advances an animated GIF's texture to the frame due at this time.
+    fn tick_animation(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let Some(loaded) = &mut self.loaded else { return };
+        let (Some(anim), Some(texture)) = (&mut loaded.anim, &mut loaded.texture) else { return };
+        if anim.paused || anim.frames.is_empty() {
+            return;
+        }
+        if now >= anim.next_at {
+            anim.index = (anim.index + 1) % anim.frames.len();
+            let (frame, delay) = &anim.frames[anim.index];
+            texture.set(egui::ImageData::Color(frame.clone()), TextureOptions::LINEAR);
+            anim.next_at = now + delay;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64((anim.next_at - now).max(0.0)));
+    }
+
+    /// Reads a snaplite looks export. A failed read keeps the old library.
+    fn load_looks_file(&mut self, path: PathBuf, remember: bool) {
+        match looks::load_looks(&path) {
+            Ok(list) => {
+                self.looks_lib = list;
+                self.looks_error = None;
+                if remember {
+                    if let Some(f) = looks_path_file() {
+                        if let Some(parent) = f.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        let _ = fs::write(f, path.to_string_lossy().as_bytes());
+                    }
+                }
+                self.looks_path = Some(path);
+                self.active_looks.clear();
+                self.refilter();
+            }
+            Err(err) => self.looks_error = Some(format!("{}: {err}", path.display())),
+        }
+    }
+
+    fn toggle_look(&mut self, index: usize) {
+        if index >= self.looks_lib.len() {
+            return;
+        }
+        if let Some(at) = self.active_looks.iter().position(|&i| i == index) {
+            self.active_looks.remove(at);
+        } else {
+            self.active_looks.push(index);
+        }
+        self.refilter();
+    }
+
+    fn start_slideshow(&mut self, ctx: &egui::Context) {
+        if self.files.is_empty() {
+            return;
+        }
+        self.slideshow = true;
+        self.slideshow_next_at = f64::INFINITY;
+        self.slideshow_shown = None;
+        self.rng_state ^= (ctx.input(|i| i.time) * 1e9) as u64 | 1;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        if self.selected_index.is_none() {
+            self.select_index(0);
+        }
+    }
+
+    fn stop_slideshow(&mut self, ctx: &egui::Context) {
+        self.slideshow = false;
+        self.slideshow_hold = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
+
+    fn next_random(&mut self) -> u64 {
+        // xorshift64
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        x
+    }
+
+    /// One frame of slideshow mode: advance on the timer (which starts once
+    /// the image is on screen) and paint it fullscreen on black.
+    fn run_slideshow(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let (esc, s_key, clicked) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::S),
+                i.pointer.any_click(),
+            )
+        });
+        if esc || s_key || clicked {
+            self.stop_slideshow(ctx);
+            return;
+        }
+        ctx.set_cursor_icon(egui::CursorIcon::None);
+
+        let shown_path = self
+            .loaded
+            .as_ref()
+            .filter(|l| l.texture.is_some())
+            .map(|l| l.path.clone());
+        if shown_path.is_some() && shown_path != self.slideshow_shown {
+            self.slideshow_shown = shown_path;
+            self.slideshow_hold = None;
+            self.slideshow_shown_at = now;
+            self.slideshow_next_at = now + self.slideshow_interval as f64;
+        } else if self.error.is_some() && self.slideshow_next_at.is_infinite() {
+            // Unreadable image: move along quickly.
+            self.slideshow_next_at = now + 1.0;
+        }
+
+        if now >= self.slideshow_next_at && !self.files.is_empty() {
+            let len = self.files.len();
+            let cur = self.selected_index.unwrap_or(0);
+            let next = if self.slideshow_shuffle && len > 1 {
+                (cur + 1 + (self.next_random() % (len as u64 - 1)) as usize) % len
+            } else {
+                (cur + 1) % len
+            };
+            self.slideshow_next_at = f64::INFINITY;
+            self.slideshow_hold = self
+                .loaded
+                .as_ref()
+                .and_then(|l| l.texture.clone().map(|t| (t, l.size)));
+            self.select_index(next);
+        }
+
+        let caption = self
+            .loaded
+            .as_ref()
+            .filter(|_| now - self.slideshow_shown_at < 3.0)
+            .map(|l| l.path.file_name().unwrap_or_default().to_string_lossy().to_string());
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::BLACK))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let current = self
+                    .loaded
+                    .as_ref()
+                    .and_then(|l| l.texture.as_ref().map(|t| (t, l.size)))
+                    .or_else(|| self.slideshow_hold.as_ref().map(|(t, s)| (t, *s)));
+                if let Some((texture, size)) = current {
+                    if size.x > 0.0 && size.y > 0.0 {
+                        let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                        let img = egui::Rect::from_center_size(rect.center(), size * scale);
+                        ui.painter().image(
+                            texture.id(),
+                            img,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+                if let Some(name) = caption {
+                    ui.painter().text(
+                        rect.left_bottom() + egui::vec2(16.0, -16.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        name,
+                        egui::FontId::proportional(16.0),
+                        Color32::from_white_alpha(150),
+                    );
+                }
+            });
+
+        if self.slideshow_next_at.is_finite() {
+            let wait = (self.slideshow_next_at - now).clamp(0.0, 0.5);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
     }
 
@@ -786,6 +1147,53 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Decodes every frame of a GIF, composited to the full canvas, with its
+/// delay in seconds. None if the file isn't a GIF or can't be decoded.
+fn decode_gif_frames(path: &Path) -> Option<Vec<(image::RgbaImage, f64)>> {
+    use image::AnimationDecoder;
+    let is_gif = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+    if !is_gif {
+        return None;
+    }
+    let file = std::io::BufReader::new(fs::File::open(path).ok()?);
+    let decoder = image::codecs::gif::GifDecoder::new(file).ok()?;
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for frame in decoder.into_frames() {
+        let frame = frame.ok()?;
+        let (num, den) = frame.delay().numer_denom_ms();
+        let ms = num as f64 / den.max(1) as f64;
+        // Browsers treat 0-10 ms delays as 100 ms; match that.
+        let secs = if ms <= 10.0 { 0.1 } else { ms / 1000.0 };
+        let buf = frame.into_buffer();
+        bytes += buf.as_raw().len();
+        if !out.is_empty() && bytes > ANIM_BYTE_BUDGET {
+            break;
+        }
+        out.push((buf, secs));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn render_frames(frames: &[(image::RgbaImage, f64)], looks: &[looks::Look]) -> Vec<(ColorImage, f64)> {
+    frames.iter().map(|(img, d)| (render_filtered(img, looks).0, *d)).collect()
+}
+
+/// The pixels as shown: the stack of looks applied to the original, plus the
+/// histogram of that result.
+fn render_filtered(original: &image::RgbaImage, looks: &[looks::Look]) -> (ColorImage, Histogram) {
+    let (w, h) = (original.width() as usize, original.height() as usize);
+    if looks.is_empty() {
+        let raw = original.as_raw();
+        return (ColorImage::from_rgba_unmultiplied([w, h], raw), Histogram::from_rgba(raw));
+    }
+    let out = looks::apply_stack(original.as_raw(), w, h, looks);
+    (ColorImage::from_rgba_unmultiplied([w, h], &out), Histogram::from_rgba(&out))
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
@@ -858,11 +1266,39 @@ impl eframe::App for GeeqApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_nav_keys(ctx);
         self.drain_load_messages(ctx);
+        self.tick_animation(ctx);
+
+        if !ctx.wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                self.filter_mode = !self.filter_mode;
+                self.refilter();
+            }
+            if !self.slideshow && ctx.input(|i| i.key_pressed(egui::Key::S)) {
+                self.start_slideshow(ctx);
+            }
+            if self.filter_mode {
+                const DIGITS: [egui::Key; 9] = [
+                    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+                    egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
+                    egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+                ];
+                for (i, key) in DIGITS.iter().enumerate() {
+                    if ctx.input(|inp| inp.key_pressed(*key)) {
+                        self.toggle_look(i);
+                    }
+                }
+            }
+        }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Backslash)) {
             if let Some(path) = self.selected_file.clone() {
                 self.toggle_clip_stack(ctx, path);
             }
+        }
+
+        if self.slideshow {
+            self.run_slideshow(ctx);
+            return;
         }
 
         // A transparent popup of thumbnails for whatever's in the clip
@@ -943,6 +1379,77 @@ impl eframe::App for GeeqApp {
                 if ui.checkbox(&mut self.show_hidden, "Show hidden folders/files").changed() {
                     self.rescan_dir();
                     self.spawn_dir_scans();
+                }
+
+                ui.separator();
+                ui.heading("Live filters");
+                if ui.checkbox(&mut self.filter_mode, "Filter mode (F)").changed() {
+                    self.refilter();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Load looks…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .set_title("snaplite looks export")
+                            .add_filter("snaplite looks (json)", &["json"])
+                            .pick_file()
+                        {
+                            self.load_looks_file(p, true);
+                        }
+                    }
+                    if self.looks_path.is_some() && ui.button("Reload").clicked() {
+                        if let Some(p) = self.looks_path.clone() {
+                            let keep = self.active_looks.clone();
+                            self.load_looks_file(p, false);
+                            if self.looks_error.is_none() {
+                                self.active_looks =
+                                    keep.into_iter().filter(|&i| i < self.looks_lib.len()).collect();
+                                self.refilter();
+                            }
+                        }
+                    }
+                });
+                if let Some(err) = &self.looks_error {
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
+                if self.looks_lib.is_empty() {
+                    ui.label("Export looks from snaplite (Looks > Export looks), then load the file.");
+                } else {
+                    let mut toggle = None;
+                    for (i, look) in self.looks_lib.iter().enumerate() {
+                        let on = self.active_looks.contains(&i);
+                        let label = if i < 9 {
+                            format!("{}  {}", i + 1, look.name)
+                        } else {
+                            format!("   {}", look.name)
+                        };
+                        if ui.selectable_label(on, label).clicked() {
+                            toggle = Some(i);
+                        }
+                    }
+                    if let Some(i) = toggle {
+                        self.toggle_look(i);
+                    }
+                    if !self.active_looks.is_empty() && ui.button("Clear").clicked() {
+                        self.active_looks.clear();
+                        self.refilter();
+                    }
+                    ui.label("Looks stack in the order switched on.");
+                }
+
+                ui.separator();
+                ui.heading("Slideshow");
+                ui.add(
+                    egui::Slider::new(&mut self.slideshow_interval, 3.0..=30.0)
+                        .suffix(" s")
+                        .text("per image"),
+                );
+                ui.checkbox(&mut self.slideshow_shuffle, "Shuffle");
+                if ui
+                    .button("Start fullscreen (S)")
+                    .on_hover_text("Cycles this folder with the selected filters. Esc, S or a click exits.")
+                    .clicked()
+                {
+                    self.start_slideshow(ctx);
                 }
 
                 ui.separator();
@@ -1262,6 +1769,32 @@ impl eframe::App for GeeqApp {
                         ui.label(format!("{}°", self.rotation as u32 * 90));
                         if self.rotation != 0 && ui.button("Reset").clicked() {
                             self.rotation = 0;
+                        }
+                        if let Some(anim) = &mut self.loaded.as_mut().and_then(|l| l.anim.as_mut()) {
+                            ui.separator();
+                            let label = if anim.paused { "▶" } else { "⏸" };
+                            if ui.button(label).on_hover_text("Pause / play the animation").clicked() {
+                                anim.paused = !anim.paused;
+                            }
+                            ui.label(format!("frame {}/{}", anim.index + 1, anim.frames.len()));
+                        }
+                        if self.filter_mode {
+                            ui.separator();
+                            let names: Vec<&str> = self
+                                .active_looks
+                                .iter()
+                                .filter_map(|&i| self.looks_lib.get(i))
+                                .map(|l| l.name.as_str())
+                                .collect();
+                            let text = if names.is_empty() {
+                                "Filters: none selected".to_string()
+                            } else {
+                                format!("Filters: {}", names.join(" → "))
+                            };
+                            ui.label(text);
+                            if self.filtering {
+                                ui.spinner();
+                            }
                         }
                     });
                 });
@@ -1658,6 +2191,8 @@ fn draw_histogram(ui: &mut egui::Ui, hist: &Histogram) {
 }
 
 fn main() -> eframe::Result<()> {
+    let start_path = std::env::args().nth(1).map(PathBuf::from);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 750.0]),
         ..Default::default()
@@ -1666,6 +2201,29 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "geeq",
         options,
-        Box::new(|_cc| Ok(Box::new(GeeqApp::new()))),
+        Box::new(|_cc| Ok(Box::new(GeeqApp::new(start_path)))),
     )
+}
+
+#[cfg(test)]
+mod gif_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_animated_gif_frames_and_delays() {
+        let path = std::env::temp_dir().join("geeq-test-anim.gif");
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(fs::File::create(&path).unwrap());
+            for c in [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]] {
+                let img = image::RgbaImage::from_pixel(8, 6, image::Rgba(c));
+                let delay = image::Delay::from_numer_denom_ms(300, 1);
+                enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).unwrap();
+            }
+        }
+        let frames = decode_gif_frames(&path).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!((frames[0].0.width(), frames[0].0.height()), (8, 6));
+        assert!((frames[0].1 - 0.3).abs() < 1e-6);
+        assert_ne!(frames[0].0.get_pixel(0, 0), frames[2].0.get_pixel(0, 0));
+    }
 }
