@@ -248,10 +248,14 @@ fn save_video_listing(v: VideoListing) {
     let _ = fs::write(path, text);
 }
 
-/// Frames sampled evenly across a video for its contact-sheet preview.
-const VIDEO_PREVIEW_FRAMES: usize = 100;
+/// Drag-and-drop payload: a file dragged from the list or grid onto a folder.
+struct DraggedFile(PathBuf);
+
+/// Frames sampled evenly across a video for its contact-sheet preview: the
+/// midpoints of equal slices spanning the whole duration.
+const VIDEO_PREVIEW_FRAMES: usize = 10;
 /// Width the preview frames are scaled to by ffmpeg.
-const VIDEO_FRAME_WIDTH: u32 = 240;
+const VIDEO_FRAME_WIDTH: u32 = 480;
 /// Concurrent ffmpeg processes extracting one video's preview frames.
 const VIDEO_WORKERS: usize = 8;
 
@@ -956,21 +960,10 @@ impl GeeqApp {
         });
     }
 
-    /// Right-click adds a file's path to a running stack and refreshes the
-    /// system clipboard with the whole stack, shell-quoted and
-    /// space-separated, so it can be pasted straight into a terminal as
-    /// arguments to `cp`/`mv`/etc.
-    fn add_to_clip_stack(&mut self, ctx: &egui::Context, path: PathBuf) {
-        if !self.clip_stack.contains(&path) {
-            self.ensure_thumbnail(path.clone());
-            self.clip_stack.push(path);
-        }
-        ctx.copy_text(self.clip_stack_text());
-        self.record_activity();
-    }
-
-    /// `\` toggles the currently open photo in/out of the clip stack -
-    /// "included"/"excluded" from whatever batch you're building up.
+    /// Right-click (or `\` on the open photo) toggles a file's path in/out
+    /// of a running stack and refreshes the system clipboard with the whole
+    /// stack, shell-quoted and space-separated, so it can be pasted straight
+    /// into a terminal as arguments to `cp`/`mv`/etc.
     fn toggle_clip_stack(&mut self, ctx: &egui::Context, path: PathBuf) {
         if let Some(pos) = self.clip_stack.iter().position(|p| *p == path) {
             self.clip_stack.remove(pos);
@@ -1005,6 +998,109 @@ impl GeeqApp {
             .map(|p| shell_quote(p))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// Re-lists the folder after a video setting changes, re-opening an
+    /// open video so a listed-only one starts loading, or dropping it if
+    /// videos are no longer listed.
+    fn apply_video_settings(&mut self) {
+        self.rescan_dir();
+        match self.selected_index {
+            Some(i) if self.video.is_some() => {
+                self.open_index(i);
+            }
+            None if self.video.is_some() => self.video = None,
+            _ => {}
+        }
+    }
+
+    /// Moves `file` into `dir` (rename, or copy + delete across
+    /// filesystems), refusing to overwrite. The clip stack follows the file
+    /// to its new path, and if it was the open file the next one opens.
+    fn move_file_to_dir(&mut self, ctx: &egui::Context, file: PathBuf, dir: PathBuf) {
+        let Some(name) = file.file_name() else { return };
+        if file.parent() == Some(dir.as_path()) {
+            return;
+        }
+        let dest = dir.join(name);
+        if dest.exists() {
+            self.error = Some(format!("Not moved: {} already exists", dest.display()));
+            return;
+        }
+        let moved = fs::rename(&file, &dest).or_else(|_| {
+            fs::copy(&file, &dest)?;
+            fs::remove_file(&file).inspect_err(|_| {
+                let _ = fs::remove_file(&dest);
+            })
+        });
+        if let Err(err) = moved {
+            self.error = Some(format!("Could not move {}: {err}", file.display()));
+            return;
+        }
+        self.error = None;
+
+        if let Some(entry) = self.clip_stack.iter_mut().find(|p| **p == file) {
+            *entry = dest;
+            ctx.copy_text(self.clip_stack_text());
+        }
+        self.exposure_points.retain(|p| p.path != file);
+        self.sharpness_points.retain(|p| p.path != file);
+        let was_open = self.selected_file.as_ref() == Some(&file);
+        let old_index = self.files.iter().position(|p| *p == file);
+        self.rescan_dir();
+        if was_open {
+            self.loaded = None;
+            self.video = None;
+            self.selected_file = None;
+            let next = old_index.unwrap_or(0).min(self.files.len().saturating_sub(1));
+            if !self.files.is_empty() {
+                self.open_index(next);
+            }
+        }
+        self.record_activity();
+    }
+
+    /// The "Video" dropdown next to the file count: how videos are listed,
+    /// plus video-only mode (also `--video` on the command line).
+    fn video_menu(&mut self, ui: &mut egui::Ui) {
+        let current = if self.video_mode {
+            "videos only"
+        } else {
+            match self.video_listing {
+                VideoListing::Hide => "hidden",
+                VideoListing::List => "listed",
+                VideoListing::Load => "previews",
+            }
+        };
+        ui.menu_button(format!("🎬 Video: {current} ⏷"), |ui| {
+            let modes = [
+                (VideoListing::Hide, "Hide videos"),
+                (VideoListing::List, "List, don't load"),
+                (VideoListing::Load, "List and load previews"),
+            ];
+            for (mode, label) in modes {
+                let on = !self.video_mode && self.video_listing == mode;
+                if ui.radio(on, label).clicked() {
+                    self.video_mode = false;
+                    if self.video_listing != mode {
+                        self.video_listing = mode;
+                        save_video_listing(mode);
+                    }
+                    self.apply_video_settings();
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui
+                .radio(self.video_mode, "Videos only")
+                .on_hover_text("List only videos and load their previews (same as --video)")
+                .clicked()
+            {
+                self.video_mode = !self.video_mode;
+                self.apply_video_settings();
+                ui.close();
+            }
+        });
     }
 
     fn clear_clip_stack(&mut self, ctx: &egui::Context) {
@@ -1521,7 +1617,8 @@ impl GeeqApp {
                         if !is_video || loads_videos {
                             self.request_thumbnail(path.clone(), gen);
                         }
-                        let (rect, resp) = ui.allocate_exact_size(cell, egui::Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(cell, egui::Sense::click_and_drag());
+                        resp.dnd_set_drag_payload(DraggedFile(path.clone()));
                         let painter = ui.painter_at(rect);
                         let selected = self.selected_index == Some(idx);
                         if selected {
@@ -1600,11 +1697,11 @@ impl GeeqApp {
             self.grid_mode = false;
         }
         if let Some(path) = clipped {
-            self.add_to_clip_stack(ctx, path);
+            self.toggle_clip_stack(ctx, path);
         }
     }
 
-    /// The selected video: a 10x10 contact sheet of evenly spaced frames that
+    /// The selected video: a contact sheet of evenly spaced frames that
     /// fill in as ffmpeg extracts them. Click a frame to view it large;
     /// Left/Right step frames there, Esc or a click goes back to the sheet.
     fn draw_video(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1689,16 +1786,23 @@ impl GeeqApp {
         }
 
         // Fit the whole sheet in the pane, no scrolling.
-        let cols = 10usize.min(expected.max(1));
-        let rows = expected.div_ceil(cols).max(1);
+        // Pick the column count that gives the biggest frames.
         let gap = 2.0;
-        let mut cell_w = (rect.width() - gap * (cols - 1) as f32) / cols as f32;
-        let mut cell_h = cell_w / aspect;
-        let max_h = (rect.height() - gap * (rows - 1) as f32) / rows as f32;
-        if cell_h > max_h {
-            cell_h = max_h;
-            cell_w = cell_h * aspect;
-        }
+        let fit = |cols: usize| {
+            let rows = expected.div_ceil(cols).max(1);
+            let mut cell_w = (rect.width() - gap * (cols - 1) as f32) / cols as f32;
+            let mut cell_h = cell_w / aspect;
+            let max_h = (rect.height() - gap * (rows - 1) as f32) / rows as f32;
+            if cell_h > max_h {
+                cell_h = max_h;
+                cell_w = cell_h * aspect;
+            }
+            (rows, cell_w, cell_h)
+        };
+        let cols = (1..=expected.max(1))
+            .max_by(|&a, &b| fit(a).1.total_cmp(&fit(b).1))
+            .unwrap_or(1);
+        let (rows, cell_w, cell_h) = fit(cols);
         let sheet = egui::vec2(
             cols as f32 * cell_w + gap * (cols - 1) as f32,
             rows as f32 * cell_h + gap * (rows - 1) as f32,
@@ -2049,6 +2153,23 @@ impl eframe::App for GeeqApp {
             return;
         }
 
+        // While a file is being dragged, its name follows the pointer.
+        if let Some(dragged) = egui::DragAndDrop::payload::<DraggedFile>(ctx) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(pos) = ctx.pointer_latest_pos() {
+                let name = dragged.0.file_name().unwrap_or_default().to_string_lossy().to_string();
+                egui::Area::new(egui::Id::new("geeq_drag_ghost"))
+                    .order(egui::Order::Tooltip)
+                    .fixed_pos(pos + egui::vec2(14.0, 6.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(format!("➜ {name}"));
+                        });
+                    });
+            }
+        }
+
         // A transparent popup of thumbnails for whatever's in the clip
         // stack, floating over the left panel.
         if !self.clip_stack.is_empty() {
@@ -2058,7 +2179,16 @@ impl eframe::App for GeeqApp {
                 .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
                 .frame(egui::Frame::popup(&ctx.style()).fill(Color32::from_black_alpha(210)))
                 .show(ctx, |ui| {
-                    ui.label(format!("📋 Clip stack ({})", self.clip_stack.len()));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("📋 Clip stack ({})", self.clip_stack.len()));
+                        if ui
+                            .small_button("Clear")
+                            .on_hover_text("Clear the clipboard stack")
+                            .clicked()
+                        {
+                            self.clear_clip_stack(ctx);
+                        }
+                    });
                     egui::ScrollArea::horizontal().max_width(500.0).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             for path in &self.clip_stack {
@@ -2141,29 +2271,6 @@ impl eframe::App for GeeqApp {
                 }
 
                 ui.checkbox(&mut self.show_dir_stats, "Folder stats panel (bottom)");
-
-                ui.separator();
-                ui.heading("Videos");
-                if self.video_mode {
-                    ui.label("Video mode: only videos are listed and their previews load.");
-                } else {
-                    let before = self.video_listing;
-                    ui.radio_value(&mut self.video_listing, VideoListing::Hide, "Hide videos");
-                    ui.radio_value(&mut self.video_listing, VideoListing::List, "List, don't load");
-                    ui.radio_value(&mut self.video_listing, VideoListing::Load, "List and load previews");
-                    if self.video_listing != before {
-                        save_video_listing(self.video_listing);
-                        self.rescan_dir();
-                        match self.selected_index {
-                            // Re-open so a listed-only video starts loading.
-                            Some(i) if self.video.is_some() => {
-                                self.open_index(i);
-                            }
-                            None if self.video.is_some() => self.video = None,
-                            _ => {}
-                        }
-                    }
-                }
 
                 ui.separator();
                 ui.heading("Live filters");
@@ -2337,6 +2444,8 @@ impl eframe::App for GeeqApp {
                 ui.separator();
 
                 // Folder surfer: subdirectories of the current directory.
+                // Files dragged from the list or grid drop onto these.
+                let mut dropped = None;
                 egui::ScrollArea::vertical()
                     .id_salt("subdirs_scroll")
                     .auto_shrink([false, false])
@@ -2348,20 +2457,30 @@ impl eframe::App for GeeqApp {
                                 if ui.selectable_label(false, "📁 .").clicked() {
                                     self.rescan_dir();
                                 }
+                                let mut targets: Vec<(String, PathBuf)> = Vec::new();
                                 if let Some(parent) = self.current_dir.parent() {
-                                    if ui.selectable_label(false, "📁 ..").clicked() {
-                                        self.navigate_to(parent.to_path_buf());
-                                    }
+                                    targets.push(("📁 ..".to_string(), parent.to_path_buf()));
                                 }
-                                for dir in self.subdirs.clone() {
+                                for dir in &self.subdirs {
                                     let name = dir
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_default();
-                                    if ui
-                                        .selectable_label(false, format!("📁 {name}"))
-                                        .clicked()
-                                    {
+                                    targets.push((format!("📁 {name}"), dir.clone()));
+                                }
+                                for (label, dir) in targets {
+                                    let resp = ui.selectable_label(false, label);
+                                    if resp.dnd_hover_payload::<DraggedFile>().is_some() {
+                                        ui.painter().rect_stroke(
+                                            resp.rect,
+                                            2.0,
+                                            ui.visuals().selection.stroke,
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    if let Some(dragged) = resp.dnd_release_payload::<DraggedFile>() {
+                                        dropped = Some((dragged.0.clone(), dir));
+                                    } else if resp.clicked() {
                                         self.navigate_to(dir);
                                     }
                                 }
@@ -2369,23 +2488,19 @@ impl eframe::App for GeeqApp {
                         );
                     });
 
+                if let Some((file, dir)) = dropped {
+                    self.move_file_to_dir(ctx, file, dir);
+                }
+
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(format!("Files ({})", self.files.len()));
-                    if !self.clip_stack.is_empty() {
-                        ui.label(format!("📋 {}", self.clip_stack.len()));
-                        if ui
-                            .small_button("Clear")
-                            .on_hover_text("Clear the clipboard stack")
-                            .clicked()
-                        {
-                            self.clear_clip_stack(ctx);
-                        }
-                    }
+                    self.video_menu(ui);
                 });
 
-                // File list. Right-click a row to add its path to the
-                // clipboard stack (paste into a terminal for cp/mv/etc).
+                // File list. Right-click a row to add/remove its path in the
+                // clipboard stack (paste into a terminal for cp/mv/etc), or
+                // drag it onto a folder above to move it there.
                 egui::ScrollArea::vertical()
                     .id_salt("files_scroll")
                     .auto_shrink([false, false])
@@ -2407,12 +2522,14 @@ impl eframe::App for GeeqApp {
                                     let is_selected = self.selected_index == Some(idx);
                                     let resp = ui
                                         .selectable_label(is_selected, label)
-                                        .on_hover_text("Right-click to copy path to clipboard stack");
+                                        .on_hover_text("Right-click to add/remove from the clipboard stack; drag onto a folder to move")
+                                        .interact(egui::Sense::click_and_drag());
+                                    resp.dnd_set_drag_payload(DraggedFile(file.clone()));
                                     if resp.clicked() {
                                         self.select_index(idx);
                                     }
                                     if resp.secondary_clicked() {
-                                        self.add_to_clip_stack(ctx, file);
+                                        self.toggle_clip_stack(ctx, file);
                                     }
                                     if is_selected && std::mem::take(&mut self.list_scroll_pending) {
                                         resp.scroll_to_me(Some(egui::Align::Center));
