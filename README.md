@@ -7,6 +7,8 @@ A minimal, fast, geeqie-style image viewer written in Rust with [egui](https://g
 ## Features
 
 - **Folder navigator + file list** on the left (`.`/`..` entries, hidden-file toggle, recently-active directories weighted by usage)
+- **Opens on the top photo**: launching geeq or entering a folder opens the folder's first image (or the file you passed on the command line)
+- **Thumbnail grid**: `G` (or Options → Thumbnail grid) swaps the image view for a grid of the whole folder. Arrow keys move between cells, `Enter` or a click opens the photo, and right-click adds it to the clip stack. Turn on Options → *Start in thumbnail grid* to open geeq in the grid every time (saved to `~/.config/geeq/start_in_grid.txt`)
 - **Fast keyboard browsing**: `↑`/`↓` or `[`/`]` step through images, with fast auto-repeat while held
 - **Image view** that fits the available space, with GPU-cheap zoom (scroll wheel or `+`/`-`, centered on the viewport) and drag-to-pan
 - **Display-only rotation** via a bottom bar under the image (doesn't touch the file on disk)

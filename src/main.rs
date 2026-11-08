@@ -7,7 +7,8 @@ use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 mod looks;
@@ -28,6 +29,25 @@ fn recent_dirs_file() -> Option<PathBuf> {
 /// Remembers which snaplite looks file was last loaded.
 fn looks_path_file() -> Option<PathBuf> {
     config_file("looks_path.txt")
+}
+
+/// Whether geeq opens in the thumbnail grid instead of the single-image view.
+fn start_in_grid_file() -> Option<PathBuf> {
+    config_file("start_in_grid.txt")
+}
+
+fn load_start_in_grid() -> bool {
+    start_in_grid_file()
+        .and_then(|f| fs::read_to_string(f).ok())
+        .is_some_and(|t| t.trim() == "1")
+}
+
+fn save_start_in_grid(on: bool) {
+    let Some(path) = start_in_grid_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, if on { "1\n" } else { "0\n" });
 }
 
 fn load_dir_activity() -> HashMap<PathBuf, u32> {
@@ -284,8 +304,22 @@ enum LoadMsg {
 const NAV_INITIAL_DELAY: f64 = 0.25;
 const NAV_REPEAT_INTERVAL: f64 = 0.03;
 const ZOOM_MIN: f32 = 1.0;
+/// Longest edge of a decoded thumbnail (grid cells and the clip-stack popup).
+const THUMB_SIZE: u32 = 160;
+/// Thumbnails decode on a small fixed pool so opening the grid on a big
+/// folder doesn't spawn a thread per image.
+const THUMB_WORKERS: usize = 4;
+const GRID_CELL: f32 = 176.0;
+const GRID_LABEL_H: f32 = 18.0;
 const ZOOM_MAX: f32 = 8.0;
 const ZOOM_KEY_STEP: f32 = 1.25;
+/// Pixel-delta wheel travel (points) that advances one photo. Wayland often
+/// reports a wheel notch as ~15 px rather than a line, so this must stay
+/// below one notch; trackpads accumulate to it.
+const WHEEL_STEP: f32 = 10.0;
+/// Longest edge of the on-screen texture. Larger photos are downscaled for
+/// display, since a texture past the GPU's limit silently renders nothing.
+const DISPLAY_MAX_SIDE: u32 = 8192;
 
 struct GeeqApp {
     current_dir: PathBuf,
@@ -302,6 +336,12 @@ struct GeeqApp {
     show_hidden: bool,
     show_info_panel: bool,
     zoom: f32,
+    /// Scroll the image pane back to its origin on the next frame (set
+    /// whenever a new image loads, so it never opens scrolled off-screen).
+    image_scroll_reset: bool,
+    /// Mouse-wheel travel over the image not yet turned into a photo step,
+    /// so trackpads (many small deltas) and wheels (one big one) both work.
+    wheel_accum: f32,
     /// Display-only rotation, in quarter turns clockwise (0..=3). Does not
     /// touch the file on disk.
     rotation: u8,
@@ -352,12 +392,26 @@ struct GeeqApp {
     /// and cached so re-adding/toggling a file doesn't re-decode it.
     thumbnail_cache: HashMap<PathBuf, TextureHandle>,
     thumbnail_pending: HashSet<PathBuf>,
-    thumb_tx: mpsc::Sender<(PathBuf, ColorImage)>,
     thumb_rx: mpsc::Receiver<(PathBuf, ColorImage)>,
+    /// Work queue for the thumbnail pool. Each job carries the folder
+    /// generation it was requested under (0 = always decode); workers skip
+    /// jobs from a folder that has since been navigated away from.
+    thumb_jobs: mpsc::Sender<(u64, PathBuf)>,
+    thumb_gen: Arc<AtomicU64>,
+    /// Thumbnail grid of the whole folder in place of the single-image view.
+    grid_mode: bool,
+    /// Persisted setting: open in grid mode.
+    start_in_grid: bool,
+    /// Columns in the grid as last laid out, so Up/Down can move by a row.
+    grid_cols: usize,
+    /// Scroll the grid to the selected cell on the next frame.
+    grid_scroll_pending: bool,
 }
 
 impl GeeqApp {
     fn new(start_path: Option<PathBuf>) -> Self {
+        let start_path = start_path.map(|p| fs::canonicalize(&p).unwrap_or(p));
+        let start_file = start_path.clone().filter(|p| p.is_file());
         let start_dir = start_path
             .and_then(|p| {
                 let p = fs::canonicalize(&p).unwrap_or(p);
@@ -367,13 +421,39 @@ impl GeeqApp {
                     p.parent().map(PathBuf::from)
                 }
             })
+            // No argument: the directory geeq was launched from.
+            .or_else(|| std::env::current_dir().ok())
             .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .unwrap_or_else(|| PathBuf::from("."));
 
         let (load_tx, load_rx) = mpsc::channel();
         let (exposure_tx, exposure_rx) = mpsc::channel();
         let (sharpness_tx, sharpness_rx) = mpsc::channel();
         let (thumb_tx, thumb_rx) = mpsc::channel();
+        let (thumb_jobs, thumb_job_rx) = mpsc::channel::<(u64, PathBuf)>();
+        let thumb_gen = Arc::new(AtomicU64::new(0));
+        let thumb_job_rx = Arc::new(Mutex::new(thumb_job_rx));
+        for _ in 0..THUMB_WORKERS {
+            let jobs = Arc::clone(&thumb_job_rx);
+            let tx = thumb_tx.clone();
+            let gen = Arc::clone(&thumb_gen);
+            thread::spawn(move || loop {
+                let job = jobs.lock().unwrap().recv();
+                let Ok((job_gen, path)) = job else { return };
+                if job_gen != 0 && job_gen != gen.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if let Ok(rgba) = decode_to_rgba(&path) {
+                    let thumb = image::DynamicImage::ImageRgba8(rgba)
+                        .thumbnail(THUMB_SIZE, THUMB_SIZE)
+                        .to_rgba8();
+                    let (w, h) = (thumb.width() as usize, thumb.height() as usize);
+                    let color_image = ColorImage::from_rgba_unmultiplied([w, h], thumb.as_raw());
+                    let _ = tx.send((path, color_image));
+                }
+            });
+        }
+        let start_in_grid = load_start_in_grid();
 
         let mut app = Self {
             current_dir: start_dir.clone(),
@@ -390,6 +470,8 @@ impl GeeqApp {
             show_hidden: false,
             show_info_panel: true,
             zoom: 1.0,
+            image_scroll_reset: true,
+            wheel_accum: 0.0,
             rotation: 0,
             clip_stack: Vec::new(),
             looks_lib: Vec::new(),
@@ -420,8 +502,13 @@ impl GeeqApp {
             dir_activity: load_dir_activity(),
             thumbnail_cache: HashMap::new(),
             thumbnail_pending: HashSet::new(),
-            thumb_tx,
             thumb_rx,
+            thumb_jobs,
+            thumb_gen,
+            grid_mode: start_in_grid,
+            start_in_grid,
+            grid_cols: 1,
+            grid_scroll_pending: true,
         };
         if let Some(path) = looks_path_file()
             .and_then(|f| fs::read_to_string(f).ok())
@@ -430,6 +517,10 @@ impl GeeqApp {
             app.load_looks_file(path, false);
         }
         app.refresh_dir();
+        // Launched on a specific file: open that one rather than the top photo.
+        if let Some(idx) = start_file.and_then(|f| app.files.iter().position(|p| *p == f)) {
+            app.open_index(idx);
+        }
         app
     }
 
@@ -550,6 +641,14 @@ impl GeeqApp {
         self.generation += 1;
         self.rescan_dir();
         self.spawn_dir_scans();
+        // Pending thumbnails for the old folder are dropped by the workers.
+        self.thumb_gen.fetch_add(1, Ordering::Relaxed);
+        self.thumbnail_pending.clear();
+        self.grid_scroll_pending = true;
+        // Every folder opens on its top photo.
+        if !self.files.is_empty() {
+            self.open_index(0);
+        }
     }
 
     /// Scans every image in the current folder in the background: exposure
@@ -596,12 +695,19 @@ impl GeeqApp {
     }
 
     fn select_index(&mut self, index: usize) {
-        if let Some(path) = self.files.get(index).cloned() {
-            self.selected_index = Some(index);
-            self.selected_file = Some(path.clone());
-            self.spawn_load(path);
+        if self.open_index(index) {
             self.record_activity();
         }
+    }
+
+    /// Selects and loads a file without counting it as user activity (used
+    /// when a folder opens on its top photo).
+    fn open_index(&mut self, index: usize) -> bool {
+        let Some(path) = self.files.get(index).cloned() else { return false };
+        self.selected_index = Some(index);
+        self.selected_file = Some(path.clone());
+        self.spawn_load(path);
+        true
     }
 
     /// Right-click adds a file's path to a running stack and refreshes the
@@ -633,19 +739,18 @@ impl GeeqApp {
     /// Kicks off a background thumbnail decode for the clip-stack popup,
     /// unless one's already cached or in flight for this path.
     fn ensure_thumbnail(&mut self, path: PathBuf) {
+        self.request_thumbnail(path, 0);
+    }
+
+    /// Queues a thumbnail decode on the worker pool, unless one's already
+    /// cached or in flight. `gen` 0 always decodes; otherwise the job is
+    /// skipped if the folder changes before a worker reaches it.
+    fn request_thumbnail(&mut self, path: PathBuf, gen: u64) {
         if self.thumbnail_cache.contains_key(&path) || self.thumbnail_pending.contains(&path) {
             return;
         }
         self.thumbnail_pending.insert(path.clone());
-        let tx = self.thumb_tx.clone();
-        thread::spawn(move || {
-            if let Ok(rgba) = decode_to_rgba(&path) {
-                let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(64, 64).to_rgba8();
-                let (w, h) = (thumb.width() as usize, thumb.height() as usize);
-                let color_image = ColorImage::from_rgba_unmultiplied([w, h], thumb.as_raw());
-                let _ = tx.send((path, color_image));
-            }
-        });
+        let _ = self.thumb_jobs.send((gen, path));
     }
 
     fn clip_stack_text(&self) -> String {
@@ -671,6 +776,7 @@ impl GeeqApp {
     fn spawn_load(&mut self, path: PathBuf) {
         self.error = None;
         self.zoom = 1.0;
+        self.image_scroll_reset = true;
         self.rotation = 0;
         self.generation += 1;
         let gen = self.generation;
@@ -1070,45 +1176,187 @@ impl GeeqApp {
         let len = self.files.len() as i32;
         let current = self.selected_index.map(|i| i as i32).unwrap_or(-1);
         let next = (current + step).clamp(0, len - 1);
-        self.select_index(next as usize);
+        // At either end of the folder, don't re-decode the photo already shown.
+        if next != current {
+            self.select_index(next as usize);
+        }
+    }
+
+    /// Thumbnail grid of every image in the folder. Click opens a photo in
+    /// the single-image view; right-click adds it to the clip stack.
+    fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label(format!("{} image(s)", self.files.len()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("View ▶").on_hover_text("Open the selected photo (Enter / G)").clicked() {
+                    self.grid_mode = false;
+                }
+            });
+        });
+        ui.separator();
+        if self.files.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No images in this folder.");
+            });
+            return;
+        }
+
+        let spacing = ui.spacing().item_spacing;
+        let cell = egui::vec2(GRID_CELL, GRID_CELL + GRID_LABEL_H);
+        let cols = (((ui.available_width() + spacing.x) / (cell.x + spacing.x)).floor() as usize).max(1);
+        self.grid_cols = cols;
+        let rows = self.files.len().div_ceil(cols);
+        let row_h = cell.y;
+
+        let mut area = egui::ScrollArea::vertical()
+            .id_salt("grid_scroll")
+            .auto_shrink([false, false]);
+        if self.grid_scroll_pending {
+            self.grid_scroll_pending = false;
+            if let Some(idx) = self.selected_index {
+                let top = (idx / cols) as f32 * (row_h + spacing.y);
+                let view_h = ui.available_height();
+                let offset = ctx.data(|d| d.get_temp::<f32>(egui::Id::new("geeq_grid_offset"))).unwrap_or(0.0);
+                if top < offset {
+                    area = area.vertical_scroll_offset(top);
+                } else if top + row_h > offset + view_h {
+                    area = area.vertical_scroll_offset(top + row_h - view_h);
+                }
+            }
+        }
+
+        let gen = self.thumb_gen.load(Ordering::Relaxed);
+        let mut clicked = None;
+        let mut clipped = None;
+        let output = area.show_rows(ui, row_h, rows, |ui, range| {
+            for r in range {
+                ui.horizontal(|ui| {
+                    for idx in (r * cols)..((r + 1) * cols).min(self.files.len()) {
+                        let path = self.files[idx].clone();
+                        self.request_thumbnail(path.clone(), gen);
+                        let (rect, resp) = ui.allocate_exact_size(cell, egui::Sense::click());
+                        let painter = ui.painter_at(rect);
+                        let selected = self.selected_index == Some(idx);
+                        if selected {
+                            painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
+                        } else if resp.hovered() {
+                            painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                        }
+                        let thumb_rect = egui::Rect::from_min_size(
+                            rect.min,
+                            egui::vec2(GRID_CELL, GRID_CELL),
+                        )
+                        .shrink(6.0);
+                        match self.thumbnail_cache.get(&path) {
+                            Some(texture) => {
+                                let size = texture.size_vec2();
+                                let scale = (thumb_rect.width() / size.x).min(thumb_rect.height() / size.y);
+                                let img_rect = egui::Rect::from_center_size(thumb_rect.center(), size * scale);
+                                painter.image(
+                                    texture.id(),
+                                    img_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            }
+                            None => {
+                                painter.rect_filled(thumb_rect, 2.0, ui.visuals().faint_bg_color);
+                            }
+                        }
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let name = if self.clip_stack.contains(&path) { format!("📋 {name}") } else { name };
+                        let label_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.min.x + 4.0, rect.max.y - GRID_LABEL_H),
+                            egui::pos2(rect.max.x - 4.0, rect.max.y),
+                        );
+                        let galley = ui.painter().layout(
+                            name,
+                            egui::TextStyle::Small.resolve(ui.style()),
+                            ui.visuals().text_color(),
+                            label_rect.width(),
+                        );
+                        // Clipped to the label strip, so long names show only their first line.
+                        let painter = ui.painter_at(label_rect);
+                        painter.galley(
+                            egui::pos2(label_rect.center().x - galley.rect.width() / 2.0, label_rect.min.y),
+                            galley,
+                            ui.visuals().text_color(),
+                        );
+                        if resp.clicked() {
+                            clicked = Some(idx);
+                        }
+                        if resp.secondary_clicked() {
+                            clipped = Some(path);
+                        }
+                    }
+                });
+            }
+        });
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("geeq_grid_offset"), output.state.offset.y));
+
+        if let Some(idx) = clicked {
+            if self.selected_index != Some(idx) {
+                self.select_index(idx);
+            }
+            self.grid_mode = false;
+        }
+        if let Some(path) = clipped {
+            self.add_to_clip_stack(ctx, path);
+        }
     }
 
     /// Handles ArrowUp/ArrowDown for fast keyboard scrolling through the file
     /// list: an immediate step on first press, then a short delay before
     /// repeating very quickly while the key is held (geeqie-style browsing).
+    /// In the thumbnail grid, Left/Right step one cell and Up/Down one row.
     fn handle_nav_keys(&mut self, ctx: &egui::Context) {
         // ArrowUp/ArrowDown and `[`/`]` are equivalent - the brackets sit
         // right next to the other hotkeys clustered at the top-right of a
         // keyboard, so they're a closer reach than the arrow cluster.
-        const UP_KEYS: [egui::Key; 2] = [egui::Key::ArrowUp, egui::Key::OpenBracket];
-        const DOWN_KEYS: [egui::Key; 2] = [egui::Key::ArrowDown, egui::Key::CloseBracket];
+        use egui::Key;
+        let row = self.grid_cols.max(1) as i32;
+        let groups: Vec<(&[Key], i32)> = if self.grid_mode && !ctx.wants_keyboard_input() {
+            vec![
+                (&[Key::ArrowUp], -row),
+                (&[Key::ArrowDown], row),
+                (&[Key::ArrowLeft, Key::OpenBracket], -1),
+                (&[Key::ArrowRight, Key::CloseBracket], 1),
+            ]
+        } else {
+            vec![
+                (&[Key::ArrowUp, Key::OpenBracket], -1),
+                (&[Key::ArrowDown, Key::CloseBracket], 1),
+            ]
+        };
 
         let now = ctx.input(|i| i.time);
-        let up_pressed = ctx.input(|i| UP_KEYS.iter().any(|&k| i.key_pressed(k)));
-        let down_pressed = ctx.input(|i| DOWN_KEYS.iter().any(|&k| i.key_pressed(k)));
+        let pressed = groups
+            .iter()
+            .position(|(keys, _)| ctx.input(|i| keys.iter().any(|&k| i.key_pressed(k))));
 
         let mut step = 0i32;
-        if up_pressed {
-            step = -1;
-            self.nav_held_key = Some(egui::Key::ArrowUp);
-            self.nav_next_repeat_at = now + NAV_INITIAL_DELAY;
-        } else if down_pressed {
-            step = 1;
-            self.nav_held_key = Some(egui::Key::ArrowDown);
+        if let Some(g) = pressed {
+            step = groups[g].1;
+            self.nav_held_key = Some(groups[g].0[0]);
             self.nav_next_repeat_at = now + NAV_INITIAL_DELAY;
         } else if let Some(key) = self.nav_held_key {
-            let keys = if key == egui::Key::ArrowUp { &UP_KEYS } else { &DOWN_KEYS };
-            let still_held = ctx.input(|i| keys.iter().any(|&k| i.key_down(k)));
+            let group = groups.iter().find(|(keys, _)| keys[0] == key);
+            let still_held = group
+                .is_some_and(|(keys, _)| ctx.input(|i| keys.iter().any(|&k| i.key_down(k))));
             if !still_held {
                 self.nav_held_key = None;
             } else if now >= self.nav_next_repeat_at {
-                step = if key == egui::Key::ArrowUp { -1 } else { 1 };
+                step = group.unwrap().1;
                 self.nav_next_repeat_at = now + NAV_REPEAT_INTERVAL;
             }
         }
 
         if step != 0 {
             self.step_selection(step);
+            self.grid_scroll_pending = true;
         }
         if self.nav_held_key.is_some() {
             // Keep polling every frame while a key is held so the repeat
@@ -1185,6 +1433,16 @@ fn render_frames(frames: &[(image::RgbaImage, f64)], looks: &[looks::Look]) -> V
 /// The pixels as shown: the stack of looks applied to the original, plus the
 /// histogram of that result.
 fn render_filtered(original: &image::RgbaImage, looks: &[looks::Look]) -> (ColorImage, Histogram) {
+    let scaled;
+    let original = if original.width().max(original.height()) > DISPLAY_MAX_SIDE {
+        let k = DISPLAY_MAX_SIDE as f32 / original.width().max(original.height()) as f32;
+        let w = ((original.width() as f32 * k).round() as u32).max(1);
+        let h = ((original.height() as f32 * k).round() as u32).max(1);
+        scaled = image::imageops::resize(original, w, h, image::imageops::FilterType::Triangle);
+        &scaled
+    } else {
+        original
+    };
     let (w, h) = (original.width() as usize, original.height() as usize);
     if looks.is_empty() {
         let raw = original.as_raw();
@@ -1276,6 +1534,13 @@ impl eframe::App for GeeqApp {
             if !self.slideshow && ctx.input(|i| i.key_pressed(egui::Key::S)) {
                 self.start_slideshow(ctx);
             }
+            if !self.slideshow && ctx.input(|i| i.key_pressed(egui::Key::G)) {
+                self.grid_mode = !self.grid_mode;
+                self.grid_scroll_pending = true;
+            }
+            if self.grid_mode && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.grid_mode = false;
+            }
             if self.filter_mode {
                 const DIGITS: [egui::Key; 9] = [
                     egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
@@ -1318,11 +1583,10 @@ impl eframe::App for GeeqApp {
                                     ui.set_width(70.0);
                                     match self.thumbnail_cache.get(path) {
                                         Some(texture) => {
-                                            let sized = egui::load::SizedTexture::new(
-                                                texture.id(),
-                                                egui::vec2(64.0, 64.0),
+                                            ui.add_sized(
+                                                [64.0, 64.0],
+                                                egui::Image::new(texture).max_size(egui::vec2(64.0, 64.0)),
                                             );
-                                            ui.add(egui::Image::from_texture(sized));
                                         }
                                         None => {
                                             ui.add_sized([64.0, 64.0], egui::Spinner::new());
@@ -1379,6 +1643,16 @@ impl eframe::App for GeeqApp {
                 if ui.checkbox(&mut self.show_hidden, "Show hidden folders/files").changed() {
                     self.rescan_dir();
                     self.spawn_dir_scans();
+                }
+                if ui.checkbox(&mut self.grid_mode, "Thumbnail grid (G)").changed() {
+                    self.grid_scroll_pending = true;
+                }
+                if ui
+                    .checkbox(&mut self.start_in_grid, "Start in thumbnail grid")
+                    .on_hover_text("Open geeq on the folder's thumbnail grid instead of the top photo")
+                    .changed()
+                {
+                    save_start_in_grid(self.start_in_grid);
                 }
 
                 ui.separator();
@@ -1644,6 +1918,11 @@ impl eframe::App for GeeqApp {
                 ui.separator();
             }
 
+            if self.grid_mode {
+                self.draw_grid(ui, ctx);
+                return;
+            }
+
             if self.loaded.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label("Select an image from the list on the left.");
@@ -1801,7 +2080,52 @@ impl eframe::App for GeeqApp {
 
             // Whatever space is left is the image viewer.
             let image_rect = ui.available_rect_before_wrap();
-            let avail = image_rect.size();
+            // Never let a cramped pane make the fit math degenerate (a
+            // zero/negative size would fall back to 1:1 and show only a corner).
+            let avail = image_rect.size().max(egui::vec2(1.0, 1.0));
+
+            // Wheel over the image pane steps through the folder: down = next,
+            // up = previous, one photo per wheel notch. Handled before the
+            // texture check so it keeps working while the next photo decodes.
+            if ui.rect_contains_pointer(image_rect) {
+                // Read the raw wheel events: a mouse notch arrives either as a
+                // Line delta (one photo each, whatever its size) or, on
+                // Wayland, as a Point delta of ~15 px; trackpads send small
+                // Point deltas. Point deltas accumulate until WHEEL_STEP.
+                let mut step = 0i32;
+                ui.input(|i| {
+                    for event in &i.events {
+                        if let egui::Event::MouseWheel { unit, delta, modifiers } = event {
+                            if modifiers.command || delta.y == 0.0 {
+                                continue;
+                            }
+                            match unit {
+                                egui::MouseWheelUnit::Point => {
+                                    // Reversing direction starts a fresh count.
+                                    if self.wheel_accum * delta.y < 0.0 {
+                                        self.wheel_accum = 0.0;
+                                    }
+                                    self.wheel_accum += delta.y;
+                                }
+                                _ => step -= delta.y.signum() as i32 * (delta.y.abs().round() as i32).max(1),
+                            }
+                        }
+                    }
+                });
+                while self.wheel_accum >= WHEEL_STEP {
+                    self.wheel_accum -= WHEEL_STEP;
+                    step -= 1;
+                }
+                while self.wheel_accum <= -WHEEL_STEP {
+                    self.wheel_accum += WHEEL_STEP;
+                    step += 1;
+                }
+                if step != 0 {
+                    self.step_selection(step);
+                }
+            } else {
+                self.wheel_accum = 0.0;
+            }
             let loaded = self.loaded.as_ref().unwrap();
 
             match &loaded.texture {
@@ -1831,15 +2155,15 @@ impl eframe::App for GeeqApp {
                         1.0
                     };
 
-                    // '+'/'-' zoom regardless of which pane has focus; the
-                    // scroll wheel only zooms while hovering the image (so it
-                    // doesn't fight scrolling the file list or EXIF panel).
-                    // Either way, zooming keeps whatever content point is
-                    // currently at the viewport's center still centered
-                    // afterwards, by adjusting the scroll offset to compensate
-                    // rather than always growing from a corner.
+                    // The scroll wheel over the image steps through the
+                    // folder's photos; Ctrl+wheel (or a pinch) zooms. '+'/'-'
+                    // zoom regardless of which pane has focus. Zooming keeps
+                    // whatever content point is currently at the viewport's
+                    // center still centered afterwards, by adjusting the
+                    // scroll offset to compensate rather than always growing
+                    // from a corner.
                     let hovering = ui.rect_contains_pointer(image_rect);
-                    let scroll = if hovering { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
+                    let zoom_factor = if hovering { ui.input(|i| i.zoom_delta()) } else { 1.0 };
                     let zoom_in = ui.input(|i| {
                         i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)
                     });
@@ -1847,8 +2171,8 @@ impl eframe::App for GeeqApp {
                     let zoom_reset = hovering && ui.input(|i| i.key_pressed(egui::Key::Num0));
 
                     let mut new_zoom = self.zoom;
-                    if scroll != 0.0 {
-                        new_zoom *= (1.0 + scroll * 0.002).clamp(0.5, 2.0);
+                    if zoom_factor != 1.0 {
+                        new_zoom *= zoom_factor.clamp(0.5, 2.0);
                     }
                     if zoom_in {
                         new_zoom *= ZOOM_KEY_STEP;
@@ -1904,13 +2228,22 @@ impl eframe::App for GeeqApp {
                     // keeping one rendering path means offset (0,0) always
                     // means "centered", which is what the zoom-centering
                     // math above assumes.
-                    egui::ScrollArea::both()
+                    // The wheel is reserved for photo stepping, so the image
+                    // pans only by dragging or the scroll bars.
+                    let mut area = egui::ScrollArea::both()
                         .id_salt("image_scroll")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_min_size(avail);
-                            ui.centered_and_justified(add_image);
+                        .scroll_source(egui::containers::scroll_area::ScrollSource {
+                            mouse_wheel: false,
+                            ..Default::default()
                         });
+                    if std::mem::take(&mut self.image_scroll_reset) {
+                        area = area.scroll_offset(egui::Vec2::ZERO);
+                    }
+                    area.show(ui, |ui| {
+                        ui.set_min_size(avail);
+                        ui.centered_and_justified(add_image);
+                    });
 
                     if let Some(exif) = &loaded.exif {
                         draw_radial_overlay(ui, image_rect.min, &exif.radial);
