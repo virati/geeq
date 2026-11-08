@@ -195,11 +195,160 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "avif", "qoi",
 ];
 
-fn is_image_file(path: &Path) -> bool {
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "mts", "m2ts",
+    "3gp",
+];
+
+fn has_extension(path: &Path, list: &[&str]) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+        .is_some_and(|e| list.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+fn is_image_file(path: &Path) -> bool {
+    has_extension(path, IMAGE_EXTENSIONS)
+}
+
+fn is_video_file(path: &Path) -> bool {
+    has_extension(path, VIDEO_EXTENSIONS)
+}
+
+/// How videos show up outside video mode: left out of the list, listed
+/// but only decoded on request, or listed with their frame previews loaded.
+#[derive(Clone, Copy, PartialEq)]
+enum VideoListing {
+    Hide,
+    List,
+    Load,
+}
+
+fn videos_file() -> Option<PathBuf> {
+    config_file("videos.txt")
+}
+
+fn load_video_listing() -> VideoListing {
+    match videos_file().and_then(|f| fs::read_to_string(f).ok()).as_deref().map(str::trim) {
+        Some("hide") => VideoListing::Hide,
+        Some("load") => VideoListing::Load,
+        _ => VideoListing::List,
+    }
+}
+
+fn save_video_listing(v: VideoListing) {
+    let Some(path) = videos_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let text = match v {
+        VideoListing::Hide => "hide\n",
+        VideoListing::List => "list\n",
+        VideoListing::Load => "load\n",
+    };
+    let _ = fs::write(path, text);
+}
+
+/// Frames sampled evenly across a video for its contact-sheet preview.
+const VIDEO_PREVIEW_FRAMES: usize = 100;
+/// Width the preview frames are scaled to by ffmpeg.
+const VIDEO_FRAME_WIDTH: u32 = 240;
+/// Concurrent ffmpeg processes extracting one video's preview frames.
+const VIDEO_WORKERS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct VideoInfo {
+    duration: f64,
+    width: u32,
+    height: u32,
+}
+
+/// Duration and frame size of a video's first video stream, via ffprobe.
+fn probe_video(path: &Path) -> Result<VideoInfo, String> {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+        .arg("stream=width,height:format=duration")
+        .args(["-of", "default=nw=1"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("ffprobe not available: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut info = VideoInfo { duration: 0.0, width: 0, height: 0 };
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("duration", v)) => info.duration = v.trim().parse().unwrap_or(0.0),
+            Some(("width", v)) => info.width = v.trim().parse().unwrap_or(0),
+            Some(("height", v)) => info.height = v.trim().parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    if info.width == 0 {
+        return Err("No video stream found".to_string());
+    }
+    Ok(info)
+}
+
+/// One frame at `secs`, scaled to `width` wide. Input-side seeking jumps to
+/// the nearest keyframe first, so this stays fast even deep into a file.
+fn video_frame(path: &Path, secs: f64, width: u32) -> Result<ColorImage, String> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", &format!("{secs:.3}"), "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-an", "-sn", "-vf", &format!("scale={width}:-2")])
+        .args(["-f", "image2pipe", "-c:v", "ppm", "-"])
+        .output()
+        .map_err(|e| format!("ffmpeg not available: {e}"))?;
+    let img = image::load_from_memory_with_format(&out.stdout, image::ImageFormat::Pnm)
+        .map_err(|_| format!("No frame at {secs:.1}s"))?
+        .to_rgba8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    Ok(ColorImage::from_rgba_unmultiplied([w, h], img.as_raw()))
+}
+
+/// A grid/clip-stack thumbnail for any listed file.
+fn make_thumbnail(path: &Path) -> Option<ColorImage> {
+    if is_video_file(path) {
+        let info = probe_video(path).ok()?;
+        return video_frame(path, info.duration * 0.1, THUMB_SIZE).ok();
+    }
+    let rgba = decode_to_rgba(path).ok()?;
+    let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(THUMB_SIZE, THUMB_SIZE).to_rgba8();
+    let (w, h) = (thumb.width() as usize, thumb.height() as usize);
+    Some(ColorImage::from_rgba_unmultiplied([w, h], thumb.as_raw()))
+}
+
+/// The selected video: its probe info and the evenly spaced preview frames
+/// as they stream in from the ffmpeg workers.
+struct VideoView {
+    path: PathBuf,
+    info: Option<VideoInfo>,
+    frames: Vec<Option<TextureHandle>>,
+    received: usize,
+    /// Frames are being (or have been) extracted.
+    loading: bool,
+    error: Option<String>,
+    /// A preview frame shown large instead of the contact sheet.
+    enlarged: Option<usize>,
+}
+
+impl VideoView {
+    fn expected(&self) -> usize {
+        match self.info {
+            Some(i) if i.duration > 0.0 => VIDEO_PREVIEW_FRAMES,
+            Some(_) => 1,
+            None => VIDEO_PREVIEW_FRAMES,
+        }
+    }
+
+    fn frame_time(&self, index: usize) -> f64 {
+        let d = self.info.map_or(0.0, |i| i.duration);
+        d * (index as f64 + 0.5) / VIDEO_PREVIEW_FRAMES as f64
+    }
+}
+
+enum VideoMsg {
+    Info(u64, VideoInfo),
+    Frame(u64, usize, ColorImage),
+    Error(u64, String),
 }
 
 struct Histogram {
@@ -406,10 +555,23 @@ struct GeeqApp {
     grid_cols: usize,
     /// Scroll the grid to the selected cell on the next frame.
     grid_scroll_pending: bool,
+    /// Scroll the file list to the selected row on the next frame.
+    list_scroll_pending: bool,
+    /// Folder-wide exposure/sharpness plots along the bottom.
+    show_dir_stats: bool,
+    /// `--video`: list only videos and always load their previews.
+    video_mode: bool,
+    video_listing: VideoListing,
+    video: Option<VideoView>,
+    video_tx: mpsc::Sender<VideoMsg>,
+    video_rx: mpsc::Receiver<VideoMsg>,
+    /// Generation the preview workers check so a superseded video stops
+    /// spawning ffmpeg processes.
+    video_gen: Arc<AtomicU64>,
 }
 
 impl GeeqApp {
-    fn new(start_path: Option<PathBuf>) -> Self {
+    fn new(start_path: Option<PathBuf>, video_mode: bool) -> Self {
         let start_path = start_path.map(|p| fs::canonicalize(&p).unwrap_or(p));
         let start_file = start_path.clone().filter(|p| p.is_file());
         let start_dir = start_path
@@ -443,17 +605,13 @@ impl GeeqApp {
                 if job_gen != 0 && job_gen != gen.load(Ordering::Relaxed) {
                     continue;
                 }
-                if let Ok(rgba) = decode_to_rgba(&path) {
-                    let thumb = image::DynamicImage::ImageRgba8(rgba)
-                        .thumbnail(THUMB_SIZE, THUMB_SIZE)
-                        .to_rgba8();
-                    let (w, h) = (thumb.width() as usize, thumb.height() as usize);
-                    let color_image = ColorImage::from_rgba_unmultiplied([w, h], thumb.as_raw());
+                if let Some(color_image) = make_thumbnail(&path) {
                     let _ = tx.send((path, color_image));
                 }
             });
         }
         let start_in_grid = load_start_in_grid();
+        let (video_tx, video_rx) = mpsc::channel();
 
         let mut app = Self {
             current_dir: start_dir.clone(),
@@ -509,6 +667,14 @@ impl GeeqApp {
             start_in_grid,
             grid_cols: 1,
             grid_scroll_pending: true,
+            list_scroll_pending: false,
+            show_dir_stats: false,
+            video_mode,
+            video_listing: load_video_listing(),
+            video: None,
+            video_tx,
+            video_rx,
+            video_gen: Arc::new(AtomicU64::new(0)),
         };
         if let Some(path) = looks_path_file()
             .and_then(|f| fs::read_to_string(f).ok())
@@ -592,6 +758,18 @@ impl GeeqApp {
             .unwrap_or(false)
     }
 
+    fn lists_file(&self, path: &Path) -> bool {
+        if self.video_mode {
+            return is_video_file(path);
+        }
+        is_image_file(path) || (self.video_listing != VideoListing::Hide && is_video_file(path))
+    }
+
+    /// Video previews (grid thumbnails and frame sheets) are decoded.
+    fn loads_videos(&self) -> bool {
+        self.video_mode || self.video_listing == VideoListing::Load
+    }
+
     /// Re-lists the current directory's contents without touching the
     /// current selection (used when toggling the "show hidden" option).
     fn rescan_dir(&mut self) {
@@ -614,7 +792,7 @@ impl GeeqApp {
             }
             if path.is_dir() {
                 self.subdirs.push(path);
-            } else if is_image_file(&path) {
+            } else if self.lists_file(&path) {
                 self.files.push(path);
             }
         }
@@ -638,7 +816,9 @@ impl GeeqApp {
         self.selected_index = None;
         self.selected_file = None;
         self.loaded = None;
+        self.video = None;
         self.generation += 1;
+        self.video_gen.store(self.generation, Ordering::Relaxed);
         self.rescan_dir();
         self.spawn_dir_scans();
         // Pending thumbnails for the old folder are dropped by the workers.
@@ -660,8 +840,9 @@ impl GeeqApp {
         self.exposure_points.clear();
         self.sharpness_points.clear();
         let gen = self.dir_generation;
+        let images: Vec<PathBuf> = self.files.iter().filter(|p| is_image_file(p)).cloned().collect();
 
-        let exposure_files = self.files.clone();
+        let exposure_files = images.clone();
         let exposure_tx = self.exposure_tx.clone();
         thread::spawn(move || {
             let points: Vec<ExposurePoint> =
@@ -669,7 +850,7 @@ impl GeeqApp {
             let _ = exposure_tx.send((gen, points));
         });
 
-        let sharpness_files = self.files.clone();
+        let sharpness_files = images;
         let sharpness_tx = self.sharpness_tx.clone();
         thread::spawn(move || {
             let points: Vec<SharpnessPoint> = sharpness_files
@@ -706,8 +887,73 @@ impl GeeqApp {
         let Some(path) = self.files.get(index).cloned() else { return false };
         self.selected_index = Some(index);
         self.selected_file = Some(path.clone());
-        self.spawn_load(path);
+        if is_video_file(&path) {
+            self.open_video(path);
+        } else {
+            self.spawn_load(path);
+        }
         true
+    }
+
+    /// Shows a video; its preview frames are extracted only if videos load
+    /// (or later via the view's "Load preview" button).
+    fn open_video(&mut self, path: PathBuf) {
+        self.error = None;
+        self.loaded = None;
+        self.generation += 1;
+        self.video_gen.store(self.generation, Ordering::Relaxed);
+        self.video = Some(VideoView {
+            path,
+            info: None,
+            frames: vec![None; VIDEO_PREVIEW_FRAMES],
+            received: 0,
+            loading: false,
+            error: None,
+            enlarged: None,
+        });
+        if self.loads_videos() {
+            self.load_video_preview();
+        }
+    }
+
+    /// Probes the selected video, then pulls its preview frames on a few
+    /// parallel ffmpeg workers; each frame is sent back as it lands.
+    fn load_video_preview(&mut self) {
+        let Some(video) = &mut self.video else { return };
+        if video.loading {
+            return;
+        }
+        video.loading = true;
+        let gen = self.generation;
+        let path = video.path.clone();
+        let tx = self.video_tx.clone();
+        let current = Arc::clone(&self.video_gen);
+        thread::spawn(move || {
+            let info = match probe_video(&path) {
+                Ok(info) => info,
+                Err(err) => {
+                    let _ = tx.send(VideoMsg::Error(gen, err));
+                    return;
+                }
+            };
+            let _ = tx.send(VideoMsg::Info(gen, info));
+            let count = if info.duration > 0.0 { VIDEO_PREVIEW_FRAMES } else { 1 };
+            let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for _ in 0..VIDEO_WORKERS.min(count) {
+                let (tx, path, next, current) =
+                    (tx.clone(), path.clone(), Arc::clone(&next), Arc::clone(&current));
+                thread::spawn(move || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= count || current.load(Ordering::Relaxed) != gen {
+                        return;
+                    }
+                    let secs = info.duration * (i as f64 + 0.5) / VIDEO_PREVIEW_FRAMES as f64;
+                    if let Ok(frame) = video_frame(&path, secs, VIDEO_FRAME_WIDTH) {
+                        let _ = tx.send(VideoMsg::Frame(gen, i, frame));
+                    }
+                });
+            }
+        });
     }
 
     /// Right-click adds a file's path to a running stack and refreshes the
@@ -778,7 +1024,9 @@ impl GeeqApp {
         self.zoom = 1.0;
         self.image_scroll_reset = true;
         self.rotation = 0;
+        self.video = None;
         self.generation += 1;
+        self.video_gen.store(self.generation, Ordering::Relaxed);
         let gen = self.generation;
         self.loaded = Some(LoadedImage {
             path: path.clone(),
@@ -818,7 +1066,10 @@ impl GeeqApp {
                     }
                 }
                 Err(err) => {
-                    let _ = decode_tx.send(LoadMsg::Error(gen, format!("Failed to open image: {err}")));
+                    let _ = decode_tx.send(LoadMsg::Error(gen, format!(
+                        "Failed to open {}: {err}",
+                        decode_path.file_name().unwrap_or_default().to_string_lossy()
+                    )));
                 }
             }
         });
@@ -941,6 +1192,32 @@ impl GeeqApp {
             ctx.request_repaint();
         }
 
+        while let Ok(msg) = self.video_rx.try_recv() {
+            let gen = match &msg {
+                VideoMsg::Info(g, _) | VideoMsg::Frame(g, _, _) | VideoMsg::Error(g, _) => *g,
+            };
+            if gen != self.generation {
+                continue;
+            }
+            let Some(video) = &mut self.video else { continue };
+            match msg {
+                VideoMsg::Info(_, info) => video.info = Some(info),
+                VideoMsg::Frame(_, i, frame) => {
+                    let texture = ctx.load_texture(format!("vframe:{i}"), frame, TextureOptions::LINEAR);
+                    if video.frames[i].replace(texture).is_none() {
+                        video.received += 1;
+                    }
+                }
+                VideoMsg::Error(_, err) => video.error = Some(err),
+            }
+        }
+        if let Some(video) = &self.video {
+            if video.loading && video.error.is_none() && video.received < video.expected() {
+                // Frames that fail to extract never arrive; poll gently.
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+
         while let Ok((gen, points)) = self.exposure_rx.try_recv() {
             if gen == self.dir_generation {
                 self.exposure_points = points;
@@ -1049,16 +1326,14 @@ impl GeeqApp {
     }
 
     fn start_slideshow(&mut self, ctx: &egui::Context) {
-        if self.files.is_empty() {
-            return;
-        }
+        let Some(first_image) = self.files.iter().position(|p| is_image_file(p)) else { return };
         self.slideshow = true;
         self.slideshow_next_at = f64::INFINITY;
         self.slideshow_shown = None;
         self.rng_state ^= (ctx.input(|i| i.time) * 1e9) as u64 | 1;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-        if self.selected_index.is_none() {
-            self.select_index(0);
+        if self.video.is_some() || self.selected_index.is_none() {
+            self.select_index(first_image);
         }
     }
 
@@ -1113,11 +1388,18 @@ impl GeeqApp {
         if now >= self.slideshow_next_at && !self.files.is_empty() {
             let len = self.files.len();
             let cur = self.selected_index.unwrap_or(0);
-            let next = if self.slideshow_shuffle && len > 1 {
+            let mut next = if self.slideshow_shuffle && len > 1 {
                 (cur + 1 + (self.next_random() % (len as u64 - 1)) as usize) % len
             } else {
                 (cur + 1) % len
             };
+            // Videos have no slide to show; take the next image after it.
+            for _ in 0..len {
+                if is_image_file(&self.files[next]) {
+                    break;
+                }
+                next = (next + 1) % len;
+            }
             self.slideshow_next_at = f64::INFINITY;
             self.slideshow_hold = self
                 .loaded
@@ -1179,6 +1461,7 @@ impl GeeqApp {
         // At either end of the folder, don't re-decode the photo already shown.
         if next != current {
             self.select_index(next as usize);
+            self.list_scroll_pending = true;
         }
     }
 
@@ -1186,7 +1469,7 @@ impl GeeqApp {
     /// the single-image view; right-click adds it to the clip stack.
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.label(format!("{} image(s)", self.files.len()));
+            ui.label(format!("{} file(s)", self.files.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("View ▶").on_hover_text("Open the selected photo (Enter / G)").clicked() {
                     self.grid_mode = false;
@@ -1196,7 +1479,7 @@ impl GeeqApp {
         ui.separator();
         if self.files.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("No images in this folder.");
+                ui.label(if self.video_mode { "No videos in this folder." } else { "No images in this folder." });
             });
             return;
         }
@@ -1226,6 +1509,7 @@ impl GeeqApp {
         }
 
         let gen = self.thumb_gen.load(Ordering::Relaxed);
+        let loads_videos = self.loads_videos();
         let mut clicked = None;
         let mut clipped = None;
         let output = area.show_rows(ui, row_h, rows, |ui, range| {
@@ -1233,7 +1517,10 @@ impl GeeqApp {
                 ui.horizontal(|ui| {
                     for idx in (r * cols)..((r + 1) * cols).min(self.files.len()) {
                         let path = self.files[idx].clone();
-                        self.request_thumbnail(path.clone(), gen);
+                        let is_video = is_video_file(&path);
+                        if !is_video || loads_videos {
+                            self.request_thumbnail(path.clone(), gen);
+                        }
                         let (rect, resp) = ui.allocate_exact_size(cell, egui::Sense::click());
                         let painter = ui.painter_at(rect);
                         let selected = self.selected_index == Some(idx);
@@ -1262,6 +1549,15 @@ impl GeeqApp {
                             None => {
                                 painter.rect_filled(thumb_rect, 2.0, ui.visuals().faint_bg_color);
                             }
+                        }
+                        if is_video {
+                            painter.text(
+                                thumb_rect.left_top() + egui::vec2(4.0, 2.0),
+                                egui::Align2::LEFT_TOP,
+                                "🎬",
+                                egui::FontId::proportional(16.0),
+                                Color32::WHITE,
+                            );
                         }
                         let name = path
                             .file_name()
@@ -1305,6 +1601,193 @@ impl GeeqApp {
         }
         if let Some(path) = clipped {
             self.add_to_clip_stack(ctx, path);
+        }
+    }
+
+    /// The selected video: a 10x10 contact sheet of evenly spaced frames that
+    /// fill in as ffmpeg extracts them. Click a frame to view it large;
+    /// Left/Right step frames there, Esc or a click goes back to the sheet.
+    fn draw_video(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut load = false;
+        let Some(video) = &mut self.video else { return };
+        let expected = video.expected();
+        ui.horizontal(|ui| {
+            let name = video.path.file_name().unwrap_or_default().to_string_lossy();
+            let mut text = format!("🎬 {name}");
+            if let Some(info) = video.info {
+                text += &format!("  ({}x{}, {:.1} s)", info.width, info.height, info.duration);
+            }
+            ui.label(text);
+            if video.loading && video.error.is_none() && video.received < expected {
+                ui.spinner();
+                ui.label(format!("{}/{expected} frames", video.received));
+            }
+            if !video.loading && ui.button("Load preview").clicked() {
+                load = true;
+            }
+        });
+        ui.separator();
+        if let Some(err) = &video.error {
+            ui.colored_label(Color32::LIGHT_RED, err);
+        }
+        if !video.loading {
+            ui.centered_and_justified(|ui| {
+                ui.label("Video not loaded (Options → Videos, or Load preview above).");
+            });
+            if load {
+                self.load_video_preview();
+            }
+            return;
+        }
+
+        let rect = ui.available_rect_before_wrap();
+        let aspect = video
+            .frames
+            .iter()
+            .flatten()
+            .next()
+            .map(|t| t.size_vec2())
+            .filter(|s| s.y > 0.0)
+            .map_or(16.0 / 9.0, |s| s.x / s.y);
+
+        if let Some(i) = video.enlarged {
+            let (left, right, esc) = ui.input(|inp| {
+                (
+                    inp.key_pressed(egui::Key::ArrowLeft),
+                    inp.key_pressed(egui::Key::ArrowRight),
+                    inp.key_pressed(egui::Key::Escape),
+                )
+            });
+            let resp = ui.allocate_rect(rect, egui::Sense::click());
+            if esc || resp.clicked() {
+                video.enlarged = None;
+            } else if left || right {
+                let n = expected.max(1);
+                video.enlarged = Some(if right { (i + 1) % n } else { (i + n - 1) % n });
+            }
+            if let Some(texture) = video.enlarged.and_then(|i| video.frames[i].as_ref()) {
+                let size = texture.size_vec2();
+                let scale = (rect.width() / size.x).min((rect.height() - 20.0) / size.y);
+                let img = egui::Rect::from_center_size(rect.center(), size * scale.max(0.01));
+                ui.painter().image(
+                    texture.id(),
+                    img,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            if let Some(i) = video.enlarged {
+                ui.painter().text(
+                    rect.left_bottom() + egui::vec2(4.0, -4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("frame {}/{expected} @ {:.1} s   ←/→ step, Esc back", i + 1, video.frame_time(i)),
+                    egui::FontId::proportional(13.0),
+                    ui.visuals().text_color(),
+                );
+            }
+            return;
+        }
+
+        // Fit the whole sheet in the pane, no scrolling.
+        let cols = 10usize.min(expected.max(1));
+        let rows = expected.div_ceil(cols).max(1);
+        let gap = 2.0;
+        let mut cell_w = (rect.width() - gap * (cols - 1) as f32) / cols as f32;
+        let mut cell_h = cell_w / aspect;
+        let max_h = (rect.height() - gap * (rows - 1) as f32) / rows as f32;
+        if cell_h > max_h {
+            cell_h = max_h;
+            cell_w = cell_h * aspect;
+        }
+        let sheet = egui::vec2(
+            cols as f32 * cell_w + gap * (cols - 1) as f32,
+            rows as f32 * cell_h + gap * (rows - 1) as f32,
+        );
+        let sheet_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.center().x - sheet.x / 2.0, rect.min.y),
+            sheet,
+        );
+        let resp = ui.allocate_rect(sheet_rect, egui::Sense::click());
+        let hover = resp.hover_pos();
+        let painter = ui.painter_at(rect);
+        let mut hovered = None;
+        for i in 0..expected {
+            let (r, c) = (i / cols, i % cols);
+            let cell = egui::Rect::from_min_size(
+                sheet_rect.min + egui::vec2(c as f32 * (cell_w + gap), r as f32 * (cell_h + gap)),
+                egui::vec2(cell_w, cell_h),
+            );
+            match &video.frames[i] {
+                Some(texture) => painter.image(
+                    texture.id(),
+                    cell,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                ),
+                None => painter.rect_filled(cell, 0.0, ui.visuals().faint_bg_color),
+            };
+            if hover.is_some_and(|p| cell.contains(p)) {
+                hovered = Some(i);
+                painter.rect_stroke(
+                    cell,
+                    0.0,
+                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        if let Some(i) = hovered {
+            let t = video.frame_time(i);
+            let resp = resp.on_hover_text(format!("frame {} @ {:.1} s", i + 1, t));
+            if resp.clicked() && video.frames[i].is_some() {
+                video.enlarged = Some(i);
+            }
+        }
+        let _ = ctx;
+    }
+
+    /// Wheel over the viewer steps through the folder: down = next, up =
+    /// previous, one file per wheel notch. Runs for every non-grid view -
+    /// loading, failed to decode, or a video - so stepping never gets stuck.
+    fn handle_wheel_stepping(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        if !ui.rect_contains_pointer(rect) {
+            self.wheel_accum = 0.0;
+            return;
+        }
+        // Read the raw wheel events: a mouse notch arrives either as a
+        // Line delta (one photo each, whatever its size) or, on
+        // Wayland, as a Point delta of ~15 px; trackpads send small
+        // Point deltas. Point deltas accumulate until WHEEL_STEP.
+        let mut step = 0i32;
+        ui.input(|i| {
+            for event in &i.events {
+                if let egui::Event::MouseWheel { unit, delta, modifiers } = event {
+                    if modifiers.command || delta.y == 0.0 {
+                        continue;
+                    }
+                    match unit {
+                        egui::MouseWheelUnit::Point => {
+                            // Reversing direction starts a fresh count.
+                            if self.wheel_accum * delta.y < 0.0 {
+                                self.wheel_accum = 0.0;
+                            }
+                            self.wheel_accum += delta.y;
+                        }
+                        _ => step -= delta.y.signum() as i32 * (delta.y.abs().round() as i32).max(1),
+                    }
+                }
+            }
+        });
+        while self.wheel_accum >= WHEEL_STEP {
+            self.wheel_accum -= WHEEL_STEP;
+            step -= 1;
+        }
+        while self.wheel_accum <= -WHEEL_STEP {
+            self.wheel_accum += WHEEL_STEP;
+            step += 1;
+        }
+        if step != 0 {
+            self.step_selection(step);
         }
     }
 
@@ -1608,27 +2091,29 @@ impl eframe::App for GeeqApp {
         // full window width, so this is registered before any SidePanel
         // claims a vertical strip - it becomes the outermost bottom panel,
         // with the nav panel and image view rendered in the space above it.
+        let has_stats = !self.exposure_points.is_empty() || !self.sharpness_points.is_empty();
         egui::TopBottomPanel::bottom("dir_panel")
-            .resizable(false)
-            .min_height(180.0)
-            .show(ctx, |ui| {
+            .resizable(true)
+            .default_height(150.0)
+            .height_range(40.0..=600.0)
+            .show_animated(ctx, self.show_dir_stats && has_stats && !self.video_mode, |ui| {
                 let current_path = self.loaded.as_ref().map(|l| l.path.as_path());
+                // Plots scale with the panel, so dragging its edge resizes them.
+                let plot_h = (ui.available_height() - 22.0).max(20.0);
                 ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(format!(
-                            "Exposure phase plot — {} photo(s)",
-                            self.exposure_points.len()
-                        ));
-                        draw_phase_plot_3d(ui, &self.exposure_points, current_path);
-                    });
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.label(format!(
-                            "Sharpness — {} photo(s)",
-                            self.sharpness_points.len()
-                        ));
-                        draw_sharpness_histogram(ui, &self.sharpness_points, current_path);
-                    });
+                    if !self.exposure_points.is_empty() {
+                        ui.vertical(|ui| {
+                            ui.label(format!("Exposure — {} photo(s)", self.exposure_points.len()));
+                            draw_phase_plot_3d(ui, &self.exposure_points, current_path, plot_h);
+                        });
+                        ui.separator();
+                    }
+                    if !self.sharpness_points.is_empty() {
+                        ui.vertical(|ui| {
+                            ui.label(format!("Sharpness — {} photo(s)", self.sharpness_points.len()));
+                            draw_sharpness_histogram(ui, &self.sharpness_points, current_path, plot_h);
+                        });
+                    }
                 });
             });
 
@@ -1653,6 +2138,31 @@ impl eframe::App for GeeqApp {
                     .changed()
                 {
                     save_start_in_grid(self.start_in_grid);
+                }
+
+                ui.checkbox(&mut self.show_dir_stats, "Folder stats panel (bottom)");
+
+                ui.separator();
+                ui.heading("Videos");
+                if self.video_mode {
+                    ui.label("Video mode: only videos are listed and their previews load.");
+                } else {
+                    let before = self.video_listing;
+                    ui.radio_value(&mut self.video_listing, VideoListing::Hide, "Hide videos");
+                    ui.radio_value(&mut self.video_listing, VideoListing::List, "List, don't load");
+                    ui.radio_value(&mut self.video_listing, VideoListing::Load, "List and load previews");
+                    if self.video_listing != before {
+                        save_video_listing(self.video_listing);
+                        self.rescan_dir();
+                        match self.selected_index {
+                            // Re-open so a listed-only video starts loading.
+                            Some(i) if self.video.is_some() => {
+                                self.open_index(i);
+                            }
+                            None if self.video.is_some() => self.video = None,
+                            _ => {}
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -1785,7 +2295,7 @@ impl eframe::App for GeeqApp {
                 });
 
                 egui::CollapsingHeader::new("⭐ Favorites")
-                    .default_open(true)
+                    .default_open(false)
                     .show(ui, |ui| {
                         let favorites = self.compute_favorites();
                         if favorites.is_empty() {
@@ -1830,7 +2340,7 @@ impl eframe::App for GeeqApp {
                 egui::ScrollArea::vertical()
                     .id_salt("subdirs_scroll")
                     .auto_shrink([false, false])
-                    .max_height(ui.available_height() * 0.35)
+                    .max_height(ui.available_height() * 0.3)
                     .show(ui, |ui| {
                         ui.with_layout(
                             egui::Layout::top_down_justified(egui::Align::LEFT),
@@ -1861,7 +2371,7 @@ impl eframe::App for GeeqApp {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(format!("Images ({})", self.files.len()));
+                    ui.label(format!("Files ({})", self.files.len()));
                     if !self.clip_stack.is_empty() {
                         ui.label(format!("📋 {}", self.clip_stack.len()));
                         if ui
@@ -1888,6 +2398,7 @@ impl eframe::App for GeeqApp {
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_default();
+                                    let name = if is_video_file(&file) { format!("🎬 {name}") } else { name };
                                     let label = if self.clip_stack.contains(&file) {
                                         format!("📋 {name}")
                                     } else {
@@ -1903,13 +2414,92 @@ impl eframe::App for GeeqApp {
                                     if resp.secondary_clicked() {
                                         self.add_to_clip_stack(ctx, file);
                                     }
-                                    if is_selected && self.nav_held_key.is_some() {
+                                    if is_selected && std::mem::take(&mut self.list_scroll_pending) {
                                         resp.scroll_to_me(Some(egui::Align::Center));
                                     }
                                 }
                             },
                         );
                     });
+            });
+
+        // Top-level (not nested in the image pane) so its edge drags like
+        // the nav panel's, without the image's pan area stealing the grab.
+        let show_info = self.show_info_panel
+            && !self.grid_mode
+            && self.video.is_none()
+            && self.loaded.is_some();
+        // Histogram + EXIF live in a resizable panel docked to the right
+        // of the remaining central space, so the divider can be dragged.
+        // It can be collapsed away entirely (sliding out to the right)
+        // to give the image more room.
+        egui::SidePanel::right("info_panel")
+            .resizable(true)
+            .default_width(260.0)
+            .width_range(120.0..=700.0)
+            .show_animated(ctx, show_info, |ui| {
+                // Also drawn while sliding shut, after the image may be gone.
+                let Some(loaded) = self.loaded.as_ref() else { return };
+                // Long values truncate instead of pinning the panel wide.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                ui.heading("Histogram");
+                match &loaded.histogram {
+                    Some(histogram) => draw_histogram(ui, histogram),
+                    None => {
+                        ui.label("Computing...");
+                    }
+                }
+
+                ui.separator();
+                ui.heading("EXIF");
+                match &loaded.exif {
+                    Some(exif) => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("exif_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if exif.key.is_empty() && exif.other.is_empty() {
+                                    ui.label("No EXIF data found.");
+                                    return;
+                                }
+                                if !exif.key.is_empty() {
+                                    egui::Grid::new("exif_key_grid")
+                                        .num_columns(2)
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            for (tag, value) in &exif.key {
+                                                ui.label(tag);
+                                                ui.label(value);
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                                if !exif.other.is_empty() {
+                                    ui.add_space(4.0);
+                                    egui::CollapsingHeader::new(format!(
+                                        "Other EXIF ({})",
+                                        exif.other.len()
+                                    ))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        egui::Grid::new("exif_other_grid")
+                                            .num_columns(2)
+                                            .striped(true)
+                                            .show(ui, |ui| {
+                                                for (tag, value) in &exif.other {
+                                                    ui.label(tag);
+                                                    ui.label(value);
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    });
+                                }
+                            });
+                    }
+                    None => {
+                        ui.label("Reading...");
+                    }
+                }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1922,11 +2512,20 @@ impl eframe::App for GeeqApp {
                 self.draw_grid(ui, ctx);
                 return;
             }
+            self.handle_wheel_stepping(ui, ui.max_rect());
+
+            if self.video.is_some() {
+                self.draw_video(ui, ctx);
+                return;
+            }
 
             if self.loaded.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Select an image from the list on the left.");
-                });
+                // A failed decode already shows its error above.
+                if self.error.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Select a file from the list on the left.");
+                    });
+                }
                 return;
             }
 
@@ -1961,76 +2560,6 @@ impl eframe::App for GeeqApp {
                 self.show_info_panel = !self.show_info_panel;
             }
             ui.separator();
-
-            // Histogram + EXIF live in a resizable panel docked to the right
-            // of the remaining central space, so the divider can be dragged.
-            // It can be collapsed away entirely (sliding out to the right)
-            // to give the image more room.
-            egui::SidePanel::right("info_panel")
-                .resizable(true)
-                .default_width(340.0)
-                .width_range(220.0..=700.0)
-                .show_animated_inside(ui, self.show_info_panel, |ui| {
-                    let loaded = self.loaded.as_ref().unwrap();
-                    ui.heading("Histogram");
-                    match &loaded.histogram {
-                        Some(histogram) => draw_histogram(ui, histogram),
-                        None => {
-                            ui.label("Computing...");
-                        }
-                    }
-
-                    ui.separator();
-                    ui.heading("EXIF");
-                    match &loaded.exif {
-                        Some(exif) => {
-                            egui::ScrollArea::vertical()
-                                .id_salt("exif_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    if exif.key.is_empty() && exif.other.is_empty() {
-                                        ui.label("No EXIF data found.");
-                                        return;
-                                    }
-                                    if !exif.key.is_empty() {
-                                        egui::Grid::new("exif_key_grid")
-                                            .num_columns(2)
-                                            .striped(true)
-                                            .show(ui, |ui| {
-                                                for (tag, value) in &exif.key {
-                                                    ui.label(tag);
-                                                    ui.label(value);
-                                                    ui.end_row();
-                                                }
-                                            });
-                                    }
-                                    if !exif.other.is_empty() {
-                                        ui.add_space(4.0);
-                                        egui::CollapsingHeader::new(format!(
-                                            "Other EXIF ({})",
-                                            exif.other.len()
-                                        ))
-                                        .default_open(false)
-                                        .show(ui, |ui| {
-                                            egui::Grid::new("exif_other_grid")
-                                                .num_columns(2)
-                                                .striped(true)
-                                                .show(ui, |ui| {
-                                                    for (tag, value) in &exif.other {
-                                                        ui.label(tag);
-                                                        ui.label(value);
-                                                        ui.end_row();
-                                                    }
-                                                });
-                                        });
-                                    }
-                                });
-                        }
-                        None => {
-                            ui.label("Reading...");
-                        }
-                    }
-                });
 
             // A rotate bar docked to the bottom of the (remaining) image pane.
             egui::TopBottomPanel::bottom("rotate_bar")
@@ -2084,48 +2613,6 @@ impl eframe::App for GeeqApp {
             // zero/negative size would fall back to 1:1 and show only a corner).
             let avail = image_rect.size().max(egui::vec2(1.0, 1.0));
 
-            // Wheel over the image pane steps through the folder: down = next,
-            // up = previous, one photo per wheel notch. Handled before the
-            // texture check so it keeps working while the next photo decodes.
-            if ui.rect_contains_pointer(image_rect) {
-                // Read the raw wheel events: a mouse notch arrives either as a
-                // Line delta (one photo each, whatever its size) or, on
-                // Wayland, as a Point delta of ~15 px; trackpads send small
-                // Point deltas. Point deltas accumulate until WHEEL_STEP.
-                let mut step = 0i32;
-                ui.input(|i| {
-                    for event in &i.events {
-                        if let egui::Event::MouseWheel { unit, delta, modifiers } = event {
-                            if modifiers.command || delta.y == 0.0 {
-                                continue;
-                            }
-                            match unit {
-                                egui::MouseWheelUnit::Point => {
-                                    // Reversing direction starts a fresh count.
-                                    if self.wheel_accum * delta.y < 0.0 {
-                                        self.wheel_accum = 0.0;
-                                    }
-                                    self.wheel_accum += delta.y;
-                                }
-                                _ => step -= delta.y.signum() as i32 * (delta.y.abs().round() as i32).max(1),
-                            }
-                        }
-                    }
-                });
-                while self.wheel_accum >= WHEEL_STEP {
-                    self.wheel_accum -= WHEEL_STEP;
-                    step -= 1;
-                }
-                while self.wheel_accum <= -WHEEL_STEP {
-                    self.wheel_accum += WHEEL_STEP;
-                    step += 1;
-                }
-                if step != 0 {
-                    self.step_selection(step);
-                }
-            } else {
-                self.wheel_accum = 0.0;
-            }
             let loaded = self.loaded.as_ref().unwrap();
 
             match &loaded.texture {
@@ -2364,8 +2851,7 @@ fn point_color(index: usize, total: usize, alpha: u8) -> Color32 {
 /// does 2D, and a real rotatable 3D view is a lot of machinery for a photo
 /// viewer), but it shows all three variables in one picture rather than
 /// three separate pairwise plots.
-fn draw_phase_plot_3d(ui: &mut egui::Ui, points: &[ExposurePoint], current: Option<&Path>) {
-    let size = 260.0;
+fn draw_phase_plot_3d(ui: &mut egui::Ui, points: &[ExposurePoint], current: Option<&Path>, size: f32) {
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_gray(20));
@@ -2428,8 +2914,8 @@ fn draw_phase_plot_3d(ui: &mut egui::Ui, points: &[ExposurePoint], current: Opti
 
 /// A histogram of sharpness (Laplacian variance) across every image in the
 /// folder, with a marker for wherever the currently open photo falls.
-fn draw_sharpness_histogram(ui: &mut egui::Ui, points: &[SharpnessPoint], current: Option<&Path>) {
-    let desired_size = egui::vec2(320.0, 140.0);
+fn draw_sharpness_histogram(ui: &mut egui::Ui, points: &[SharpnessPoint], current: Option<&Path>, height: f32) {
+    let desired_size = egui::vec2(height * 2.3, height);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_gray(20));
@@ -2524,7 +3010,10 @@ fn draw_histogram(ui: &mut egui::Ui, hist: &Histogram) {
 }
 
 fn main() -> eframe::Result<()> {
-    let start_path = std::env::args().nth(1).map(PathBuf::from);
+    // `--video` (or `-V`): list only videos and show their frame previews.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let video_mode = args.iter().any(|a| a == "--video" || a == "-V");
+    let start_path = args.iter().find(|a| !a.starts_with('-')).map(PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 750.0]),
@@ -2532,9 +3021,9 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "geeq",
+        if video_mode { "geeq (video mode)" } else { "geeq" },
         options,
-        Box::new(|_cc| Ok(Box::new(GeeqApp::new(start_path)))),
+        Box::new(|_cc| Ok(Box::new(GeeqApp::new(start_path, video_mode)))),
     )
 }
 
