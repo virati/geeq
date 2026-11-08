@@ -1141,11 +1141,14 @@ impl GeeqApp {
         let rev = self.filter_rev;
         let active = self.active_look_list();
         thread::spawn(move || {
-            // Animated GIFs decode every frame; a single-frame GIF (or one
-            // that fails here) takes the ordinary still-image path.
-            let frames = decode_gif_frames(&decode_path).filter(|f| f.len() > 1);
-            let decoded = match &frames {
-                Some(f) => Ok(Arc::new(f[0].0.clone())),
+            // Animated GIF/WebP: the first frame shows as soon as it's
+            // decoded, then the rest stream in and the animation starts. A
+            // still WebP, or a GIF whose first frame fails, takes the
+            // ordinary still-image path.
+            let mut anim = anim_frames(&decode_path);
+            let first = anim.as_mut().and_then(|it| it.next()).and_then(|f| f.ok()).map(frame_with_delay);
+            let decoded = match &first {
+                Some((img, _)) => Ok(Arc::new(img.clone())),
                 None => decode_to_rgba(&decode_path).map(Arc::new),
             };
             match decoded {
@@ -1154,6 +1157,10 @@ impl GeeqApp {
                     let (color_image, histogram) = render_filtered(&rgba, &active);
                     let _ = decode_tx.send(LoadMsg::Texture(gen, rev, decode_path.clone(), color_image));
                     let _ = decode_tx.send(LoadMsg::Histogram(gen, rev, decode_path.clone(), histogram));
+                    let frames = match (first, anim) {
+                        (Some(first), Some(rest)) => Some(collect_anim(first, rest)).filter(|f| f.len() > 1),
+                        _ => None,
+                    };
                     if let Some(frames) = frames {
                         let frames = Arc::new(frames);
                         let rendered = render_frames(&frames, &active);
@@ -1370,7 +1377,7 @@ impl GeeqApp {
         });
     }
 
-    /// Advances an animated GIF's texture to the frame due at this time.
+    /// Advances an animated GIF/WebP's texture to the frame due at this time.
     fn tick_animation(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         let Some(loaded) = &mut self.loaded else { return };
@@ -1982,35 +1989,57 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Decodes every frame of a GIF, composited to the full canvas, with its
-/// delay in seconds. None if the file isn't a GIF or can't be decoded.
-fn decode_gif_frames(path: &Path) -> Option<Vec<(image::RgbaImage, f64)>> {
+/// The frames of an animated GIF or WebP, composited to the full canvas.
+/// None for other formats and for still WebPs.
+fn anim_frames(path: &Path) -> Option<image::Frames<'static>> {
     use image::AnimationDecoder;
-    let is_gif = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
-    if !is_gif {
-        return None;
-    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     let file = std::io::BufReader::new(fs::File::open(path).ok()?);
-    let decoder = image::codecs::gif::GifDecoder::new(file).ok()?;
-    let mut out = Vec::new();
-    let mut bytes = 0usize;
-    for frame in decoder.into_frames() {
-        let frame = frame.ok()?;
-        let (num, den) = frame.delay().numer_denom_ms();
-        let ms = num as f64 / den.max(1) as f64;
-        // Browsers treat 0-10 ms delays as 100 ms; match that.
-        let secs = if ms <= 10.0 { 0.1 } else { ms / 1000.0 };
-        let buf = frame.into_buffer();
-        bytes += buf.as_raw().len();
-        if !out.is_empty() && bytes > ANIM_BYTE_BUDGET {
+    match ext.as_str() {
+        "gif" => Some(image::codecs::gif::GifDecoder::new(file).ok()?.into_frames()),
+        "webp" => {
+            let decoder = image::codecs::webp::WebPDecoder::new(file).ok()?;
+            decoder.has_animation().then(|| decoder.into_frames())
+        }
+        _ => None,
+    }
+}
+
+/// A decoded frame and its delay in seconds.
+fn frame_with_delay(frame: image::Frame) -> (image::RgbaImage, f64) {
+    let (num, den) = frame.delay().numer_denom_ms();
+    let ms = num as f64 / den.max(1) as f64;
+    // Browsers treat 0-10 ms delays as 100 ms; match that.
+    let secs = if ms <= 10.0 { 0.1 } else { ms / 1000.0 };
+    (frame.into_buffer(), secs)
+}
+
+/// The first frame plus the rest, stopping at a decode error or once the
+/// frames pass ANIM_BYTE_BUDGET.
+fn collect_anim(
+    first: (image::RgbaImage, f64),
+    rest: image::Frames<'static>,
+) -> Vec<(image::RgbaImage, f64)> {
+    let mut bytes = first.0.as_raw().len();
+    let mut out = vec![first];
+    for frame in rest {
+        let Ok(frame) = frame else { break };
+        let frame = frame_with_delay(frame);
+        bytes += frame.0.as_raw().len();
+        if bytes > ANIM_BYTE_BUDGET {
             break;
         }
-        out.push((buf, secs));
+        out.push(frame);
     }
-    (!out.is_empty()).then_some(out)
+    out
+}
+
+/// Every frame of an animated GIF or WebP, with delays.
+#[cfg(test)]
+fn decode_anim_frames(path: &Path) -> Option<Vec<(image::RgbaImage, f64)>> {
+    let mut frames = anim_frames(path)?;
+    let first = frame_with_delay(frames.next()?.ok()?);
+    Some(collect_anim(first, frames))
 }
 
 fn render_frames(frames: &[(image::RgbaImage, f64)], looks: &[looks::Look]) -> Vec<(ColorImage, f64)> {
@@ -3159,7 +3188,7 @@ mod gif_tests {
                 enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).unwrap();
             }
         }
-        let frames = decode_gif_frames(&path).unwrap();
+        let frames = decode_anim_frames(&path).unwrap();
         assert_eq!(frames.len(), 3);
         assert_eq!((frames[0].0.width(), frames[0].0.height()), (8, 6));
         assert!((frames[0].1 - 0.3).abs() < 1e-6);
