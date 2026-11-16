@@ -31,25 +31,6 @@ fn looks_path_file() -> Option<PathBuf> {
     config_file("looks_path.txt")
 }
 
-/// Whether geeq opens in the thumbnail grid instead of the single-image view.
-fn start_in_grid_file() -> Option<PathBuf> {
-    config_file("start_in_grid.txt")
-}
-
-fn load_start_in_grid() -> bool {
-    start_in_grid_file()
-        .and_then(|f| fs::read_to_string(f).ok())
-        .is_some_and(|t| t.trim() == "1")
-}
-
-fn save_start_in_grid(on: bool) {
-    let Some(path) = start_in_grid_file() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let _ = fs::write(path, if on { "1\n" } else { "0\n" });
-}
-
 fn load_dir_activity() -> HashMap<PathBuf, u32> {
     let mut map = HashMap::new();
     let Some(path) = recent_dirs_file() else { return map };
@@ -230,8 +211,8 @@ fn videos_file() -> Option<PathBuf> {
 fn load_video_listing() -> VideoListing {
     match videos_file().and_then(|f| fs::read_to_string(f).ok()).as_deref().map(str::trim) {
         Some("hide") => VideoListing::Hide,
-        Some("load") => VideoListing::Load,
-        _ => VideoListing::List,
+        Some("list") => VideoListing::List,
+        _ => VideoListing::Load,
     }
 }
 
@@ -553,8 +534,10 @@ struct GeeqApp {
     thumb_gen: Arc<AtomicU64>,
     /// Thumbnail grid of the whole folder in place of the single-image view.
     grid_mode: bool,
-    /// Persisted setting: open in grid mode.
-    start_in_grid: bool,
+    /// Left folder/file panel, opened from the radial menu.
+    show_nav_panel: bool,
+    /// Where the right-click radial menu is open, if it is.
+    radial: Option<egui::Pos2>,
     /// Columns in the grid as last laid out, so Up/Down can move by a row.
     grid_cols: usize,
     /// Scroll the grid to the selected cell on the next frame.
@@ -614,7 +597,6 @@ impl GeeqApp {
                 }
             });
         }
-        let start_in_grid = load_start_in_grid();
         let (video_tx, video_rx) = mpsc::channel();
 
         let mut app = Self {
@@ -630,7 +612,7 @@ impl GeeqApp {
             nav_next_repeat_at: 0.0,
             show_options: false,
             show_hidden: false,
-            show_info_panel: true,
+            show_info_panel: false,
             zoom: 1.0,
             image_scroll_reset: true,
             wheel_accum: 0.0,
@@ -667,8 +649,9 @@ impl GeeqApp {
             thumb_rx,
             thumb_jobs,
             thumb_gen,
-            grid_mode: start_in_grid,
-            start_in_grid,
+            grid_mode: false,
+            show_nav_panel: false,
+            radial: None,
             grid_cols: 1,
             grid_scroll_pending: true,
             list_scroll_pending: false,
@@ -1569,8 +1552,9 @@ impl GeeqApp {
     }
 
     /// Thumbnail grid of every image in the folder. Click opens a photo in
-    /// the single-image view; right-click adds it to the clip stack.
-    fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// the single-image view; right-click toggles it in the clip stack (and
+    /// returns true so the radial menu stays shut).
+    fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
         ui.horizontal(|ui| {
             ui.label(format!("{} file(s)", self.files.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1584,7 +1568,7 @@ impl GeeqApp {
             ui.centered_and_justified(|ui| {
                 ui.label(if self.video_mode { "No videos in this folder." } else { "No images in this folder." });
             });
-            return;
+            return false;
         }
 
         let spacing = ui.spacing().item_spacing;
@@ -1703,9 +1687,11 @@ impl GeeqApp {
             }
             self.grid_mode = false;
         }
+        let right_click_used = clipped.is_some();
         if let Some(path) = clipped {
             self.toggle_clip_stack(ctx, path);
         }
+        right_click_used
     }
 
     /// The selected video: a contact sheet of evenly spaced frames that
@@ -2138,6 +2124,11 @@ fn read_exif(path: &Path) -> ExifInfo {
 
 impl eframe::App for GeeqApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.radial.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.radial = None;
+        }
         self.handle_nav_keys(ctx);
         self.drain_load_messages(ctx);
         self.tick_animation(ctx);
@@ -2291,13 +2282,6 @@ impl eframe::App for GeeqApp {
                 if ui.checkbox(&mut self.grid_mode, "Thumbnail grid (G)").changed() {
                     self.grid_scroll_pending = true;
                 }
-                if ui
-                    .checkbox(&mut self.start_in_grid, "Start in thumbnail grid")
-                    .on_hover_text("Open geeq on the folder's thumbnail grid instead of the top photo")
-                    .changed()
-                {
-                    save_start_in_grid(self.start_in_grid);
-                }
 
                 ui.checkbox(&mut self.show_dir_stats, "Folder stats panel (bottom)");
 
@@ -2410,14 +2394,8 @@ impl eframe::App for GeeqApp {
                 egui::Frame::side_top_panel(&ctx.style())
                     .inner_margin(egui::Margin { left: 8, right: 0, top: 8, bottom: 8 }),
             )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let toggle_label = if self.show_options { "⟨ Options" } else { "☰ Options" };
-                    if ui.button(toggle_label).clicked() {
-                        self.show_options = !self.show_options;
-                    }
-                    ui.heading("Folders");
-                });
+            .show_animated(ctx, self.show_nav_panel, |ui| {
+                ui.heading("Folders");
 
                 ui.horizontal(|ui| {
                     if ui.button("Up").clicked() {
@@ -2648,14 +2626,264 @@ impl eframe::App for GeeqApp {
                 }
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // The picture fills the window; everything else is reached through
+        // the right-click radial menu.
+        let central_frame = if self.grid_mode {
+            egui::Frame::central_panel(&ctx.style())
+        } else {
+            egui::Frame::new().fill(Color32::BLACK)
+        };
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+            let central_rect = ui.max_rect();
+            let mut right_click_used = false;
+            self.draw_central(ui, ctx, &mut right_click_used);
+
             if let Some(err) = &self.error {
-                ui.colored_label(Color32::LIGHT_RED, err);
-                ui.separator();
+                ui.painter().text(
+                    central_rect.left_top() + egui::vec2(12.0, 10.0),
+                    egui::Align2::LEFT_TOP,
+                    err,
+                    egui::FontId::proportional(14.0),
+                    Color32::LIGHT_RED,
+                );
             }
 
+            let opens_radial = !right_click_used
+                && ui.input(|i| i.pointer.secondary_clicked())
+                && ui
+                    .input(|i| i.pointer.interact_pos())
+                    .is_some_and(|p| central_rect.contains(p) && ctx.layer_id_at(p) == Some(ui.layer_id()));
+            if opens_radial {
+                self.radial = ui.input(|i| i.pointer.interact_pos());
+            }
+        });
+
+        self.show_radial(ctx);
+    }
+}
+
+/// What a slot in the right-click radial menu does.
+#[derive(Clone, Copy)]
+enum RadialAction {
+    Files,
+    Info,
+    Plots,
+    Video,
+    Grid,
+    Filters,
+    Slideshow,
+    Rotate,
+    Clip,
+    Pause,
+    Folder,
+    Up,
+    Options,
+}
+
+/// Distance from the menu's center to each slot, and each slot's radius.
+const RADIAL_RING: f32 = 112.0;
+const RADIAL_ITEM: f32 = 33.0;
+
+impl GeeqApp {
+    /// The radial menu's slots, clockwise from the top: action, label,
+    /// whether it's currently on, and a hover hint.
+    fn radial_items(&self) -> Vec<(RadialAction, String, bool, &'static str)> {
+        let video = if self.video_mode {
+            "only"
+        } else {
+            match self.video_listing {
+                VideoListing::Hide => "hide",
+                VideoListing::List => "list",
+                VideoListing::Load => "load",
+            }
+        };
+        let mut items = vec![
+            (RadialAction::Files, "◧\nFiles".to_string(), self.show_nav_panel, "Folder and file browser (left)"),
+            (RadialAction::Info, "◨\nInfo".to_string(), self.show_info_panel, "Histogram and EXIF (right)"),
+            (RadialAction::Plots, "⬓\nPlots".to_string(), self.show_dir_stats, "Folder exposure/sharpness plots (bottom)"),
+            (
+                RadialAction::Video,
+                format!("🎬\n{video}"),
+                self.video_mode || self.video_listing != VideoListing::Hide,
+                "Video mode: hide → list → load previews → videos only",
+            ),
+            (RadialAction::Grid, "▦\nGrid".to_string(), self.grid_mode, "Thumbnail grid (G)"),
+            (RadialAction::Filters, "✨\nFilters".to_string(), self.filter_mode, "Live looks filters (F); pick looks in Options"),
+            (RadialAction::Slideshow, "▶\nShow".to_string(), false, "Fullscreen slideshow (S)"),
+            (RadialAction::Rotate, "⟳\nRotate".to_string(), self.rotation != 0, "Rotate 90° (display only)"),
+        ];
+        if let Some(path) = &self.selected_file {
+            let on = self.clip_stack.contains(path);
+            items.push((RadialAction::Clip, "📋\nClip".to_string(), on, "Add/remove this file in the clip stack (\\)"));
+        }
+        if let Some(anim) = self.loaded.as_ref().and_then(|l| l.anim.as_ref()) {
+            let label = if anim.paused { "▶\nPlay" } else { "⏸\nPause" };
+            items.push((RadialAction::Pause, label.to_string(), anim.paused, "Pause / play the animation"));
+        }
+        items.extend([
+            (RadialAction::Folder, "📂\nOpen".to_string(), false, "Choose a folder"),
+            (RadialAction::Up, "⬆\nUp".to_string(), false, "Parent folder"),
+            (RadialAction::Options, "⚙\nOptions".to_string(), self.show_options, "Options panel: looks, slideshow, recent folders"),
+        ]);
+        items
+    }
+
+    /// Runs a radial menu action. Returns true if the menu should stay
+    /// open (actions you'd tap repeatedly, like cycling or rotating).
+    fn radial_action(&mut self, ctx: &egui::Context, action: RadialAction) -> bool {
+        match action {
+            RadialAction::Files => self.show_nav_panel = !self.show_nav_panel,
+            RadialAction::Info => self.show_info_panel = !self.show_info_panel,
+            RadialAction::Plots => self.show_dir_stats = !self.show_dir_stats,
+            RadialAction::Video => {
+                let next = if self.video_mode {
+                    self.video_mode = false;
+                    VideoListing::Hide
+                } else {
+                    match self.video_listing {
+                        VideoListing::Hide => VideoListing::List,
+                        VideoListing::List => VideoListing::Load,
+                        VideoListing::Load => {
+                            self.video_mode = true;
+                            VideoListing::Load
+                        }
+                    }
+                };
+                if self.video_listing != next {
+                    self.video_listing = next;
+                    save_video_listing(next);
+                }
+                self.apply_video_settings();
+                return true;
+            }
+            RadialAction::Grid => {
+                self.grid_mode = !self.grid_mode;
+                self.grid_scroll_pending = true;
+            }
+            RadialAction::Filters => {
+                self.filter_mode = !self.filter_mode;
+                self.refilter();
+            }
+            RadialAction::Slideshow => self.start_slideshow(ctx),
+            RadialAction::Rotate => {
+                self.rotation = (self.rotation + 1) % 4;
+                self.record_activity();
+                return true;
+            }
+            RadialAction::Clip => {
+                if let Some(path) = self.selected_file.clone() {
+                    self.toggle_clip_stack(ctx, path);
+                }
+            }
+            RadialAction::Pause => {
+                if let Some(anim) = self.loaded.as_mut().and_then(|l| l.anim.as_mut()) {
+                    anim.paused = !anim.paused;
+                }
+                return true;
+            }
+            RadialAction::Folder => {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.navigate_to(dir);
+                }
+            }
+            RadialAction::Up => self.navigate_up(),
+            RadialAction::Options => self.show_options = !self.show_options,
+        }
+        false
+    }
+
+    /// The right-click radial menu: a ring of round buttons around where
+    /// the click landed, kept fully on screen. A click outside the ring,
+    /// the center ✕ or Esc closes it.
+    fn show_radial(&mut self, ctx: &egui::Context) {
+        let Some(center) = self.radial else { return };
+        let items = self.radial_items();
+        let outer = RADIAL_RING + RADIAL_ITEM + 8.0;
+        let screen = ctx.screen_rect();
+        let center = egui::pos2(
+            center.x.min(screen.right() - outer).max(screen.left() + outer),
+            center.y.min(screen.bottom() - outer).max(screen.top() + outer),
+        );
+        self.radial = Some(center);
+
+        let mut chosen = None;
+        let mut close = false;
+        egui::Area::new(egui::Id::new("geeq_radial"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(center - egui::Vec2::splat(outer))
+            .show(ctx, |ui| {
+                // Swallows clicks on the disc between slots.
+                ui.allocate_exact_size(egui::Vec2::splat(outer * 2.0), egui::Sense::click());
+                let painter = ui.painter();
+                painter.circle_filled(center, outer, Color32::from_black_alpha(170));
+
+                let n = items.len();
+                for (i, (action, label, on, hint)) in items.iter().enumerate() {
+                    let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n as f32;
+                    let pos = center + RADIAL_RING * egui::vec2(angle.cos(), angle.sin());
+                    let slot = egui::Rect::from_center_size(pos, egui::Vec2::splat(RADIAL_ITEM * 2.0));
+                    let resp = ui
+                        .interact(slot, egui::Id::new(("geeq_radial_slot", i)), egui::Sense::click())
+                        .on_hover_text(*hint);
+                    let fill = if resp.hovered() {
+                        ui.visuals().selection.bg_fill
+                    } else if *on {
+                        Color32::from_rgb(52, 78, 112)
+                    } else {
+                        Color32::from_gray(42)
+                    };
+                    painter.circle_filled(pos, RADIAL_ITEM, fill);
+                    if *on {
+                        painter.circle_stroke(pos, RADIAL_ITEM, egui::Stroke::new(1.5, Color32::from_rgb(120, 170, 230)));
+                    }
+                    painter.text(
+                        pos,
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    if resp.clicked() {
+                        chosen = Some(*action);
+                    }
+                }
+
+                let close_rect = egui::Rect::from_center_size(center, egui::Vec2::splat(40.0));
+                let close_resp = ui
+                    .interact(close_rect, egui::Id::new("geeq_radial_close"), egui::Sense::click())
+                    .on_hover_text("Close (Esc)");
+                let fill = if close_resp.hovered() { Color32::from_gray(80) } else { Color32::from_gray(55) };
+                painter.circle_filled(center, 20.0, fill);
+                painter.text(center, egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(16.0), Color32::WHITE);
+                if close_resp.clicked() {
+                    close = true;
+                }
+            });
+
+        let pressed_outside = ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| p.distance(center) > outer)
+        });
+        if pressed_outside {
+            close = true;
+        }
+        if let Some(action) = chosen {
+            if !self.radial_action(ctx, action) {
+                close = true;
+            }
+        }
+        if close {
+            self.radial = None;
+        }
+    }
+
+    /// The central pane: thumbnail grid, a video's frame sheet, or the
+    /// current photo. `right_click_used` is set when a right-click there
+    /// did something itself (clipping a grid cell), so it doesn't also
+    /// open the radial menu.
+    fn draw_central(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, right_click_used: &mut bool) {
+        {
             if self.grid_mode {
-                self.draw_grid(ui, ctx);
+                *right_click_used = self.draw_grid(ui, ctx);
                 return;
             }
             self.handle_wheel_stepping(ui, ui.max_rect());
@@ -2666,92 +2894,17 @@ impl eframe::App for GeeqApp {
             }
 
             if self.loaded.is_none() {
-                // A failed decode already shows its error above.
+                // A failed decode already shows its error.
                 if self.error.is_none() {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Select a file from the list on the left.");
+                        ui.label(
+                            egui::RichText::new("Right-click for the menu (Files opens the folder browser).")
+                                .color(Color32::GRAY),
+                        );
                     });
                 }
                 return;
             }
-
-            let mut toggle_info_panel = false;
-            {
-                let loaded = self.loaded.as_ref().unwrap();
-                ui.horizontal(|ui| {
-                    let name = loaded.path.file_name().unwrap_or_default().to_string_lossy();
-                    if loaded.texture.is_some() {
-                        ui.label(format!(
-                            "{name}  ({}x{})  zoom {:.0}%",
-                            loaded.size.x as i32,
-                            loaded.size.y as i32,
-                            self.zoom * 100.0
-                        ));
-                    } else {
-                        ui.label(format!("{name}  (decoding...)"));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if self.show_info_panel { "Info ▶" } else { "◀ Info" };
-                        if ui
-                            .button(label)
-                            .on_hover_text("Collapse/expand the histogram/EXIF panel")
-                            .clicked()
-                        {
-                            toggle_info_panel = true;
-                        }
-                    });
-                });
-            }
-            if toggle_info_panel {
-                self.show_info_panel = !self.show_info_panel;
-            }
-            ui.separator();
-
-            // A rotate bar docked to the bottom of the (remaining) image pane.
-            egui::TopBottomPanel::bottom("rotate_bar")
-                .resizable(false)
-                .show_inside(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("⟲").on_hover_text("Rotate left (display only)").clicked() {
-                            self.rotation = (self.rotation + 3) % 4;
-                            self.record_activity();
-                        }
-                        if ui.button("⟳").on_hover_text("Rotate right (display only)").clicked() {
-                            self.rotation = (self.rotation + 1) % 4;
-                            self.record_activity();
-                        }
-                        ui.label(format!("{}°", self.rotation as u32 * 90));
-                        if self.rotation != 0 && ui.button("Reset").clicked() {
-                            self.rotation = 0;
-                        }
-                        if let Some(anim) = &mut self.loaded.as_mut().and_then(|l| l.anim.as_mut()) {
-                            ui.separator();
-                            let label = if anim.paused { "▶" } else { "⏸" };
-                            if ui.button(label).on_hover_text("Pause / play the animation").clicked() {
-                                anim.paused = !anim.paused;
-                            }
-                            ui.label(format!("frame {}/{}", anim.index + 1, anim.frames.len()));
-                        }
-                        if self.filter_mode {
-                            ui.separator();
-                            let names: Vec<&str> = self
-                                .active_looks
-                                .iter()
-                                .filter_map(|&i| self.looks_lib.get(i))
-                                .map(|l| l.name.as_str())
-                                .collect();
-                            let text = if names.is_empty() {
-                                "Filters: none selected".to_string()
-                            } else {
-                                format!("Filters: {}", names.join(" → "))
-                            };
-                            ui.label(text);
-                            if self.filtering {
-                                ui.spinner();
-                            }
-                        }
-                    });
-                });
 
             // Whatever space is left is the image viewer.
             let image_rect = ui.available_rect_before_wrap();
@@ -2888,7 +3041,60 @@ impl eframe::App for GeeqApp {
                     });
                 }
             }
-        });
+            self.draw_caption(ui, image_rect);
+        }
+    }
+
+    /// A faint one-line caption along the bottom of the photo: name,
+    /// position in the folder, size, zoom, rotation and active filters.
+    fn draw_caption(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(loaded) = &self.loaded else { return };
+        let name = loaded.path.file_name().unwrap_or_default().to_string_lossy();
+        let mut text = name.to_string();
+        if let Some(i) = self.selected_index {
+            text += &format!("   {}/{}", i + 1, self.files.len());
+        }
+        if loaded.texture.is_some() {
+            text += &format!("   {}x{}", loaded.size.x as i32, loaded.size.y as i32);
+            if self.zoom > ZOOM_MIN {
+                text += &format!("   {:.0}%", self.zoom * 100.0);
+            }
+        } else {
+            text += "   decoding…";
+        }
+        if self.rotation != 0 {
+            text += &format!("   ⟳{}°", self.rotation as u32 * 90);
+        }
+        if let Some(anim) = &loaded.anim {
+            let state = if anim.paused { "paused" } else { "playing" };
+            text += &format!("   frame {}/{} {state}", anim.index + 1, anim.frames.len());
+        }
+        if self.clip_stack.contains(&loaded.path) {
+            text += "   📋";
+        }
+        if self.filter_mode {
+            let names: Vec<&str> = self
+                .active_looks
+                .iter()
+                .filter_map(|&i| self.looks_lib.get(i))
+                .map(|l| l.name.as_str())
+                .collect();
+            text += &if names.is_empty() {
+                "   filters: none".to_string()
+            } else {
+                format!("   filters: {}", names.join(" → "))
+            };
+            if self.filtering {
+                text += " …";
+            }
+        }
+        ui.painter().text(
+            rect.left_bottom() + egui::vec2(12.0, -10.0),
+            egui::Align2::LEFT_BOTTOM,
+            text,
+            egui::FontId::proportional(13.0),
+            Color32::from_white_alpha(140),
+        );
     }
 }
 
@@ -3195,3 +3401,4 @@ mod gif_tests {
         assert_ne!(frames[0].0.get_pixel(0, 0), frames[2].0.get_pixel(0, 0));
     }
 }
+
