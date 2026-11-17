@@ -388,6 +388,9 @@ struct RadialStats {
 /// shutter speed, f-stop, date) and everything else, so the UI can show the
 /// key info up front and tuck the rest behind a collapsible section.
 struct ExifInfo {
+    /// Camera body ("Make Model") shown as the headline of the EXIF panel,
+    /// since telling cameras apart matters more than any single setting.
+    camera: Option<String>,
     key: Vec<(String, String)>,
     other: Vec<(String, String)>,
     radial: RadialStats,
@@ -2064,10 +2067,46 @@ const EXIF_KEY_TAGS: &[(exif::Tag, &str)] = &[
     (exif::Tag::ExposureTime, "Shutter Speed"),
     (exif::Tag::FNumber, "F-Stop"),
     (exif::Tag::FocalLength, "Focal Length"),
+    (exif::Tag::LensModel, "Lens"),
 ];
 
+/// Plain text of an ASCII EXIF field, without the quotes `display_value` adds.
+fn exif_ascii(exif_data: &exif::Exif, tag: exif::Tag) -> Option<String> {
+    let field = exif_data.get_field(tag, exif::In::PRIMARY)?;
+    match &field.value {
+        exif::Value::Ascii(parts) => {
+            let text = parts
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).trim_matches(char::from(0)).trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+/// "Make Model", dropping the make when the model already starts with it
+/// (e.g. Canon writes Make "Canon", Model "Canon EOS R5").
+fn camera_name(exif_data: &exif::Exif) -> Option<String> {
+    let make = exif_ascii(exif_data, exif::Tag::Make);
+    let model = exif_ascii(exif_data, exif::Tag::Model);
+    match (make, model) {
+        (Some(make), Some(model)) => {
+            let make_word = make.split_whitespace().next().unwrap_or(&make).to_lowercase();
+            if model.to_lowercase().starts_with(&make_word) {
+                Some(model)
+            } else {
+                Some(format!("{make} {model}"))
+            }
+        }
+        (make, model) => model.or(make),
+    }
+}
+
 fn read_exif(path: &Path) -> ExifInfo {
-    let empty = || ExifInfo { key: Vec::new(), other: Vec::new(), radial: RadialStats::default() };
+    let empty = || ExifInfo { camera: None, key: Vec::new(), other: Vec::new(), radial: RadialStats::default() };
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return empty(),
@@ -2079,9 +2118,13 @@ fn read_exif(path: &Path) -> ExifInfo {
         Err(_) => return empty(),
     };
 
+    let camera = camera_name(&exif_data);
     let mut key = Vec::new();
     let mut other = Vec::new();
     for field in exif_data.fields() {
+        if camera.is_some() && matches!(field.tag, exif::Tag::Make | exif::Tag::Model) {
+            continue;
+        }
         let value = field.display_value().with_unit(&exif_data).to_string();
         match EXIF_KEY_TAGS.iter().find(|(tag, _)| *tag == field.tag) {
             Some((_, label)) => key.push((label.to_string(), value)),
@@ -2098,7 +2141,7 @@ fn read_exif(path: &Path) -> ExifInfo {
         }
     }
 
-    let preferred_order = ["Date Taken", "ISO", "Shutter Speed", "F-Stop", "Focal Length"];
+    let preferred_order = ["Date Taken", "Lens", "ISO", "Shutter Speed", "F-Stop", "Focal Length"];
     key.sort_by_key(|(label, _)| {
         preferred_order.iter().position(|o| o == label).unwrap_or(usize::MAX)
     });
@@ -2119,7 +2162,7 @@ fn read_exif(path: &Path) -> ExifInfo {
             .and_then(|f| exif_uint_f32(&f.value)),
     };
 
-    ExifInfo { key, other, radial }
+    ExifInfo { camera, key, other, radial }
 }
 
 impl eframe::App for GeeqApp {
@@ -2582,10 +2625,18 @@ impl eframe::App for GeeqApp {
                             .id_salt("exif_scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                if exif.key.is_empty() && exif.other.is_empty() {
+                                if exif.camera.is_none() && exif.key.is_empty() && exif.other.is_empty() {
                                     ui.label("No EXIF data found.");
                                     return;
                                 }
+                                ui.label(
+                                    egui::RichText::new(
+                                        exif.camera.as_deref().unwrap_or("Unknown camera"),
+                                    )
+                                    .size(18.0)
+                                    .strong(),
+                                );
+                                ui.add_space(4.0);
                                 if !exif.key.is_empty() {
                                     egui::Grid::new("exif_key_grid")
                                         .num_columns(2)
