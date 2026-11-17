@@ -6,7 +6,7 @@ A minimal, fast, geeqie-style image viewer written in Rust with [egui](https://g
 
 ## Commands
 
-Install (the package is named `cgeeq`, so this installs a `cgeeq` binary):
+Install (installs a `geeq` binary):
 
 ```sh
 cargo install --path .
@@ -15,16 +15,12 @@ cargo install --path .
 Run:
 
 ```sh
-cgeeq [file-or-folder]
+geeq [file-or-folder]
 ```
 
-Run compact (streamlined full-window UI, everything in the right-click radial menu):
+The full UI (folder list, info and plot panels) is the default. Toggle the compact UI (full-window picture, everything in the right-click radial menu) with `C`, Options, or the radial menu; the choice is remembered in `~/.config/geeq/compact.txt`.
 
-```sh
-cargo run --release -- [file-or-folder]
-```
-
-Video mode: add `--video` (or `-V`) to either command.
+Video mode: add `--video` (or `-V`).
 
 ## Features
 
