@@ -150,7 +150,19 @@ fn exif_uint_f32(value: &exif::Value) -> Option<f32> {
 fn read_exposure_point(path: &Path) -> Option<ExposurePoint> {
     let file = fs::File::open(path).ok()?;
     let mut bufreader = std::io::BufReader::new(file);
-    let exif_data = exif::Reader::new().read_from_container(&mut bufreader).ok()?;
+    let exif_data = match exif::Reader::new().read_from_container(&mut bufreader) {
+        Ok(d) => d,
+        Err(_) if is_raw_file(path) => {
+            let r = exif_info_from_raw(path)?.radial;
+            return Some(ExposurePoint {
+                path: path.to_path_buf(),
+                fstop: r.fstop?,
+                shutter_secs: r.shutter_secs?,
+                iso: r.iso?,
+            });
+        }
+        Err(_) => return None,
+    };
 
     let fstop = exif_data
         .get_field(exif::Tag::FNumber, exif::In::PRIMARY)
@@ -215,6 +227,13 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "avif", "qoi",
 ];
 
+/// Camera raw formats, decoded by `rawler` (which sniffs the content, so the
+/// ambiguous `.raw` extension is fine).
+const RAW_EXTENSIONS: &[&str] = &[
+    "dng", "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2",
+    "rwl", "pef", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mef", "mos", "iiq", "x3f",
+];
+
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "mts", "m2ts",
     "3gp",
@@ -227,7 +246,11 @@ fn has_extension(path: &Path, list: &[&str]) -> bool {
 }
 
 fn is_image_file(path: &Path) -> bool {
-    has_extension(path, IMAGE_EXTENSIONS)
+    has_extension(path, IMAGE_EXTENSIONS) || is_raw_file(path)
+}
+
+fn is_raw_file(path: &Path) -> bool {
+    has_extension(path, RAW_EXTENSIONS)
 }
 
 fn is_video_file(path: &Path) -> bool {
@@ -2023,6 +2046,14 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
         }
     }
 
+    if is_raw_file(path) {
+        // The embedded full-size preview when the file has one (fast, and
+        // the camera's own rendering), otherwise a developed raw.
+        return rawler::analyze::extract_full_pixels(path, &Default::default())
+            .map(|img| img.to_rgba8())
+            .map_err(|e| e.to_string());
+    }
+
     image::open(path)
         .map(|img| img.to_rgba8())
         .map_err(|e| e.to_string())
@@ -2155,6 +2186,68 @@ fn camera_name(exif_data: &exif::Exif) -> Option<String> {
     }
 }
 
+/// EXIF for camera raws whose container `kamadak-exif` can't walk (RW2, RAF,
+/// CR3, ...), via rawler's own metadata decode.
+fn raw_metadata(path: &Path) -> Option<rawler::decoders::RawMetadata> {
+    use rawler::decoders::{Decoder, RawDecodeParams};
+    let src = rawler::rawsource::RawSource::new(path).ok()?;
+    let decoder = rawler::get_decoder(&src).ok()?;
+    decoder.raw_metadata(&src, &RawDecodeParams::default()).ok()
+}
+
+fn rat_f32(r: &rawler::formats::tiff::Rational) -> Option<f32> {
+    (r.d != 0).then(|| r.n as f32 / r.d as f32)
+}
+
+fn exif_info_from_raw(path: &Path) -> Option<ExifInfo> {
+    let md = raw_metadata(path)?;
+    let e = &md.exif;
+    let focal_mm = e.focal_length.as_ref().and_then(rat_f32);
+    let shutter_secs = e.exposure_time.as_ref().and_then(rat_f32);
+    let fstop = e.fnumber.as_ref().and_then(rat_f32);
+    let iso = e.iso_speed_ratings.map(|v| v as u32).or(e.iso_speed).map(|v| v as f32);
+
+    let make = md.make.trim();
+    let model = md.model.trim();
+    let camera = match (make.is_empty(), model.is_empty()) {
+        (_, true) if make.is_empty() => None,
+        (_, true) => Some(make.to_string()),
+        (true, false) => Some(model.to_string()),
+        (false, false) if model.to_ascii_lowercase().starts_with(&make.to_ascii_lowercase()) => {
+            Some(model.to_string())
+        }
+        (false, false) => Some(format!("{make} {model}")),
+    };
+
+    let mut key = Vec::new();
+    if let Some(d) = &e.date_time_original {
+        key.push(("Date Taken".to_string(), d.clone()));
+    }
+    if let Some(l) = e.lens_model.clone().or_else(|| md.lens.as_ref().map(|l| l.lens_name.clone())) {
+        key.push(("Lens".to_string(), l));
+    }
+    if let Some(v) = iso {
+        key.push(("ISO".to_string(), format!("{v:.0}")));
+    }
+    if let Some(t) = shutter_secs {
+        let text = if t >= 1.0 { format!("{t:.1} s") } else { format!("1/{:.0} s", 1.0 / t) };
+        key.push(("Shutter Speed".to_string(), text));
+    }
+    if let Some(f) = fstop {
+        key.push(("F-Stop".to_string(), format!("f/{f:.1}")));
+    }
+    if let Some(f) = focal_mm {
+        key.push(("Focal Length".to_string(), format!("{f:.1} mm")));
+    }
+
+    Some(ExifInfo {
+        camera,
+        key,
+        other: Vec::new(),
+        radial: RadialStats { focal_mm, shutter_secs, fstop, iso },
+    })
+}
+
 fn read_exif(path: &Path) -> ExifInfo {
     let empty = || ExifInfo { camera: None, key: Vec::new(), other: Vec::new(), radial: RadialStats::default() };
     let file = match fs::File::open(path) {
@@ -2165,6 +2258,7 @@ fn read_exif(path: &Path) -> ExifInfo {
     let exif_reader = exif::Reader::new();
     let exif_data = match exif_reader.read_from_container(&mut bufreader) {
         Ok(d) => d,
+        Err(_) if is_raw_file(path) => return exif_info_from_raw(path).unwrap_or_else(empty),
         Err(_) => return empty(),
     };
 
@@ -3616,6 +3710,19 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod gif_tests {
     use super::*;
+
+    /// Set GEEQ_TEST_RAW to a camera raw/DNG path to exercise the raw decoder.
+    #[test]
+    fn decodes_raw_file_when_provided() {
+        let Ok(p) = std::env::var("GEEQ_TEST_RAW") else { return };
+        let path = Path::new(&p);
+        assert!(is_image_file(path));
+        let img = decode_to_rgba(path).expect("raw decode");
+        eprintln!("raw decoded {}x{}", img.width(), img.height());
+        assert!(img.width() > 0 && img.height() > 0);
+        let exif = read_exif(path);
+        eprintln!("exif camera: {:?}, key fields: {}", exif.camera, exif.key.len());
+    }
 
     #[test]
     fn decodes_animated_gif_frames_and_delays() {

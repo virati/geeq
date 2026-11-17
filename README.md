@@ -37,6 +37,7 @@ Video mode: add `--video` (or `-V`).
 - **Live filters**: load the looks exported from [snaplite](../snaplite) (Looks → Export looks → `snaplite-looks.json`) via Options → Live filters → Load looks. With filter mode on (`F`), toggle looks with the number keys `1`–`9` or the list; they stack in the order switched on and are applied on the fly to every image as you browse. Display-only, like rotation: files on disk are never touched. The pixel pipeline is a Rust port of snaplite's engine; geometry (crop/rotate) isn't part of a look.
 - **Slideshow / screensaver**: `S` (or Options → Slideshow) goes fullscreen and cycles the folder every 3–30 s (default 7, optional shuffle) with the currently selected live filters applied. `Esc`, `S` or a click exits; arrow keys still step manually
 - **Animated GIFs** play in the viewer (pause/play and frame counter in the bottom bar); live filters apply to every frame
+- **Camera raw / DNG**: `.dng`, `.raw`, `.rw2`, `.cr2`/`.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.pef` and more open like any other photo (via [rawler](https://crates.io/crates/rawler)). Uses the embedded full-size preview when the file has one, otherwise develops the raw data. Display only; the files are never touched
 - JPEG decoding via libjpeg-turbo (`turbojpeg`); everything else via the `image` crate
 
 ## Running
