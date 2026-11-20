@@ -537,7 +537,8 @@ struct GeeqApp {
     thumb_gen: Arc<AtomicU64>,
     /// Thumbnail grid of the whole folder in place of the single-image view.
     grid_mode: bool,
-    /// Left folder/file panel, opened from the radial menu.
+    /// Left folder/file panel: open at start for geeq, shut for cgeeq;
+    /// toggled from the radial menu.
     show_nav_panel: bool,
     /// Where the right-click radial menu is open, if it is.
     radial: Option<egui::Pos2>,
@@ -566,7 +567,7 @@ struct GeeqApp {
 }
 
 impl GeeqApp {
-    fn new(start_path: Option<PathBuf>, video_mode: bool) -> Self {
+    fn new(start_path: Option<PathBuf>, video_mode: bool, show_files: bool) -> Self {
         let start_path = start_path.map(|p| fs::canonicalize(&p).unwrap_or(p));
         let start_file = start_path.clone().filter(|p| p.is_file());
         let start_dir = start_path
@@ -658,7 +659,7 @@ impl GeeqApp {
             thumb_jobs,
             thumb_gen,
             grid_mode: false,
-            show_nav_panel: false,
+            show_nav_panel: show_files,
             radial: None,
             radial_held: false,
             radial_moved: false,
@@ -3493,6 +3494,11 @@ fn draw_histogram(ui: &mut egui::Ui, hist: &Histogram) {
 fn main() -> eframe::Result<()> {
     // `--video` (or `-V`): list only videos and show their frame previews.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Started as `cgeeq` (a link to geeq): open on just the picture.
+    // argv[0], since current_exe() resolves the link back to geeq.
+    let show_files = std::env::args()
+        .next()
+        .is_none_or(|a| Path::new(&a).file_stem().is_none_or(|s| s != "cgeeq"));
     let video_mode = args.iter().any(|a| a == "--video" || a == "-V");
     let start_path = args.iter().find(|a| !a.starts_with('-')).map(PathBuf::from);
 
@@ -3504,7 +3510,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         if video_mode { "geeq (video mode)" } else { "geeq" },
         options,
-        Box::new(|_cc| Ok(Box::new(GeeqApp::new(start_path, video_mode)))),
+        Box::new(|_cc| Ok(Box::new(GeeqApp::new(start_path, video_mode, show_files)))),
     )
 }
 
