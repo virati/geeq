@@ -1591,7 +1591,11 @@ impl GeeqApp {
 
         let mut area = egui::ScrollArea::vertical()
             .id_salt("grid_scroll")
-            .auto_shrink([false, false]);
+            .auto_shrink([false, false])
+            .scroll_source(egui::containers::scroll_area::ScrollSource {
+                drag: self.drag_pans(ctx),
+                ..Default::default()
+            });
         if self.grid_scroll_pending {
             self.grid_scroll_pending = false;
             if let Some(idx) = self.selected_index {
@@ -2862,6 +2866,17 @@ impl GeeqApp {
         false
     }
 
+    /// Whether a drag may pan the picture pane. egui pans on a drag with
+    /// any button, but the right button belongs to the radial menu (and
+    /// to clipping grid cells): no panning while it is down, on the frame
+    /// it lets go (egui would fling the pane), or while the menu is open.
+    fn drag_pans(&self, ctx: &egui::Context) -> bool {
+        self.radial.is_none()
+            && !ctx.input(|i| {
+                i.pointer.secondary_down() || i.pointer.button_released(egui::PointerButton::Secondary)
+            })
+    }
+
     /// The right-click radial menu: a hazy ring of labels around where the
     /// right button went down, kept fully on screen. Hold the button, move
     /// toward a label to highlight it, release to pick it; release in the
@@ -3151,6 +3166,7 @@ impl GeeqApp {
                         .auto_shrink([false, false])
                         .scroll_source(egui::containers::scroll_area::ScrollSource {
                             mouse_wheel: false,
+                            drag: self.drag_pans(ctx),
                             ..Default::default()
                         });
                     if std::mem::take(&mut self.image_scroll_reset) {
