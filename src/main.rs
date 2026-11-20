@@ -541,6 +541,11 @@ struct GeeqApp {
     show_nav_panel: bool,
     /// Where the right-click radial menu is open, if it is.
     radial: Option<egui::Pos2>,
+    /// The right button that opened the radial menu is still down:
+    /// releasing it picks the slot under the pointer.
+    radial_held: bool,
+    /// The held pointer has left the center, so releasing back there cancels.
+    radial_moved: bool,
     /// Columns in the grid as last laid out, so Up/Down can move by a row.
     grid_cols: usize,
     /// Scroll the grid to the selected cell on the next frame.
@@ -655,6 +660,8 @@ impl GeeqApp {
             grid_mode: false,
             show_nav_panel: false,
             radial: None,
+            radial_held: false,
+            radial_moved: false,
             grid_cols: 1,
             grid_scroll_pending: true,
             list_scroll_pending: false,
@@ -1602,6 +1609,7 @@ impl GeeqApp {
         let loads_videos = self.loads_videos();
         let mut clicked = None;
         let mut clipped = None;
+        let mut cell_hovered = false;
         let output = area.show_rows(ui, row_h, rows, |ui, range| {
             for r in range {
                 ui.horizontal(|ui| {
@@ -1678,6 +1686,9 @@ impl GeeqApp {
                         if resp.secondary_clicked() {
                             clipped = Some(path);
                         }
+                        if resp.hovered() {
+                            cell_hovered = true;
+                        }
                     }
                 });
             }
@@ -1690,7 +1701,9 @@ impl GeeqApp {
             }
             self.grid_mode = false;
         }
-        let right_click_used = clipped.is_some();
+        // A right press on a cell is for clipping, not the radial menu.
+        let right_click_used =
+            clipped.is_some() || (cell_hovered && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)));
         if let Some(path) = clipped {
             self.toggle_clip_stack(ctx, path);
         }
@@ -2171,6 +2184,7 @@ impl eframe::App for GeeqApp {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.radial = None;
+            self.radial_held = false;
         }
         self.handle_nav_keys(ctx);
         self.drain_load_messages(ctx);
@@ -2700,12 +2714,14 @@ impl eframe::App for GeeqApp {
             }
 
             let opens_radial = !right_click_used
-                && ui.input(|i| i.pointer.secondary_clicked())
+                && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary))
                 && ui
                     .input(|i| i.pointer.interact_pos())
                     .is_some_and(|p| central_rect.contains(p) && ctx.layer_id_at(p) == Some(ui.layer_id()));
             if opens_radial {
                 self.radial = ui.input(|i| i.pointer.interact_pos());
+                self.radial_held = true;
+                self.radial_moved = false;
             }
         });
 
@@ -2734,6 +2750,8 @@ enum RadialAction {
 /// Distance from the menu's center to each slot, and each slot's radius.
 const RADIAL_RING: f32 = 112.0;
 const RADIAL_ITEM: f32 = 33.0;
+/// Pointer within this of the center highlights nothing (the ✕).
+const RADIAL_CENTER: f32 = 22.0;
 
 impl GeeqApp {
     /// The radial menu's slots, clockwise from the top: action, label,
@@ -2843,9 +2861,11 @@ impl GeeqApp {
         false
     }
 
-    /// The right-click radial menu: a ring of round buttons around where
-    /// the click landed, kept fully on screen. A click outside the ring,
-    /// the center ✕ or Esc closes it.
+    /// The right-click radial menu: a hazy ring of labels around where the
+    /// right button went down, kept fully on screen. Hold the button, move
+    /// toward a label to highlight it, release to pick it; release in the
+    /// middle (without having left it) keeps the menu open for clicking.
+    /// A click outside the ring, the center ✕ or Esc closes it.
     fn show_radial(&mut self, ctx: &egui::Context) {
         let Some(center) = self.radial else { return };
         let items = self.radial_items();
@@ -2857,66 +2877,123 @@ impl GeeqApp {
         );
         self.radial = Some(center);
 
-        let mut chosen = None;
-        let mut close = false;
+        let n = items.len();
+        let slot_angle = |i: usize| -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n as f32;
+        // Highlight by direction, like a pie: anywhere past the ✕ counts,
+        // so a short flick toward a label is enough.
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let in_center = pointer.is_none_or(|p| p.distance(center) <= RADIAL_CENTER);
+        let highlight = pointer.filter(|_| !in_center).map(|p| {
+            let d = p - center;
+            let turn = (d.y.atan2(d.x) + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU);
+            (turn / std::f32::consts::TAU * n as f32).round() as usize % n
+        });
+        if self.radial_held && !in_center {
+            self.radial_moved = true;
+        }
+
         egui::Area::new(egui::Id::new("geeq_radial"))
             .order(egui::Order::Foreground)
             .fixed_pos(center - egui::Vec2::splat(outer))
             .show(ctx, |ui| {
-                // Swallows clicks on the disc between slots.
-                ui.allocate_exact_size(egui::Vec2::splat(outer * 2.0), egui::Sense::click());
+                // Swallows clicks and drags on the disc.
+                ui.allocate_exact_size(egui::Vec2::splat(outer * 2.0), egui::Sense::click_and_drag());
                 let painter = ui.painter();
-                painter.circle_filled(center, outer, Color32::from_black_alpha(170));
 
-                let n = items.len();
-                for (i, (action, label, on, hint)) in items.iter().enumerate() {
-                    let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n as f32;
-                    let pos = center + RADIAL_RING * egui::vec2(angle.cos(), angle.sin());
-                    let slot = egui::Rect::from_center_size(pos, egui::Vec2::splat(RADIAL_ITEM * 2.0));
-                    let resp = ui
-                        .interact(slot, egui::Id::new(("geeq_radial_slot", i)), egui::Sense::click())
-                        .on_hover_text(*hint);
-                    let fill = if resp.hovered() {
-                        ui.visuals().selection.bg_fill
-                    } else if *on {
-                        Color32::from_rgb(52, 78, 112)
-                    } else {
-                        Color32::from_gray(42)
-                    };
-                    painter.circle_filled(pos, RADIAL_ITEM, fill);
-                    if *on {
-                        painter.circle_stroke(pos, RADIAL_ITEM, egui::Stroke::new(1.5, Color32::from_rgb(120, 170, 230)));
-                    }
-                    painter.text(
-                        pos,
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(12.0),
-                        Color32::WHITE,
-                    );
-                    if resp.clicked() {
-                        chosen = Some(*action);
-                    }
+                // Hazy ring: dark at the label circle, fading to clear on
+                // both sides.
+                let half = RADIAL_ITEM + 14.0;
+                let mut r = RADIAL_RING - half;
+                while r <= RADIAL_RING + half {
+                    let t = 1.0 - ((r - RADIAL_RING).abs() / half);
+                    let alpha = (150.0 * t * t) as u8;
+                    painter.circle_stroke(center, r, egui::Stroke::new(2.5, Color32::from_black_alpha(alpha)));
+                    r += 2.0;
                 }
 
-                let close_rect = egui::Rect::from_center_size(center, egui::Vec2::splat(40.0));
-                let close_resp = ui
-                    .interact(close_rect, egui::Id::new("geeq_radial_close"), egui::Sense::click())
-                    .on_hover_text("Close (Esc)");
-                let fill = if close_resp.hovered() { Color32::from_gray(80) } else { Color32::from_gray(55) };
-                painter.circle_filled(center, 20.0, fill);
-                painter.text(center, egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(16.0), Color32::WHITE);
-                if close_resp.clicked() {
-                    close = true;
+                for (i, (_, label, on, _)) in items.iter().enumerate() {
+                    let angle = slot_angle(i);
+                    let pos = center + RADIAL_RING * egui::vec2(angle.cos(), angle.sin());
+                    let color = if *on { Color32::from_rgb(140, 195, 255) } else { Color32::WHITE };
+                    let galley = painter.layout(
+                        label.clone(),
+                        egui::FontId::proportional(13.0),
+                        color,
+                        f32::INFINITY,
+                    );
+                    let text_rect = egui::Align2::CENTER_CENTER.anchor_size(pos, galley.size());
+                    if highlight == Some(i) {
+                        let box_rect = text_rect.expand2(egui::vec2(8.0, 4.0));
+                        painter.rect_filled(box_rect, 6.0, Color32::from_white_alpha(28));
+                        painter.rect_stroke(
+                            box_rect,
+                            6.0,
+                            egui::Stroke::new(1.5, Color32::WHITE),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    // Dark outline keeps the text readable on bright photos.
+                    for off in [egui::vec2(1.0, 1.0), egui::vec2(-1.0, 1.0), egui::vec2(1.0, -1.0), egui::vec2(-1.0, -1.0)] {
+                        painter.galley_with_override_text_color(
+                            text_rect.min + off,
+                            galley.clone(),
+                            Color32::from_black_alpha(200),
+                        );
+                    }
+                    painter.galley(text_rect.min, galley, color);
+                }
+
+                let fill = if in_center && pointer.is_some() { Color32::from_black_alpha(190) } else { Color32::from_black_alpha(120) };
+                painter.circle_filled(center, 16.0, fill);
+                painter.text(center, egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(15.0), Color32::WHITE);
+
+                // What the highlighted slot does, under (or above) the ring.
+                if let Some(i) = highlight {
+                    let below = center.y + outer + 24.0 < screen.bottom();
+                    let (at, align) = if below {
+                        (center + egui::vec2(0.0, outer + 4.0), egui::Align2::CENTER_TOP)
+                    } else {
+                        (center - egui::vec2(0.0, outer + 4.0), egui::Align2::CENTER_BOTTOM)
+                    };
+                    let galley = painter.layout_no_wrap(items[i].3.to_string(), egui::FontId::proportional(12.0), Color32::WHITE);
+                    let rect = align.anchor_size(at, galley.size());
+                    painter.rect_filled(rect.expand2(egui::vec2(6.0, 3.0)), 4.0, Color32::from_black_alpha(170));
+                    painter.galley(rect.min, galley, Color32::WHITE);
                 }
             });
 
-        let pressed_outside = ctx.input(|i| {
-            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| p.distance(center) > outer)
+        let (sec_released, sec_pressed, prim_clicked, pressed_outside) = ctx.input(|i| {
+            (
+                i.pointer.button_released(egui::PointerButton::Secondary),
+                i.pointer.button_pressed(egui::PointerButton::Secondary),
+                i.pointer.button_clicked(egui::PointerButton::Primary),
+                i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| p.distance(center) > outer),
+            )
         });
-        if pressed_outside {
-            close = true;
+
+        let mut chosen = None;
+        let mut close = pressed_outside;
+        if self.radial_held {
+            if sec_released {
+                self.radial_held = false;
+                match highlight {
+                    Some(i) => chosen = Some(items[i].0),
+                    // Back in the middle after moving out: cancel. A plain
+                    // right-click stays open for clicking.
+                    None => close = self.radial_moved,
+                }
+            }
+        } else if sec_pressed && !pressed_outside {
+            // Right press on an open menu starts a new hold.
+            self.radial_held = true;
+            self.radial_moved = false;
+        } else if prim_clicked && !pressed_outside {
+            match highlight {
+                Some(i) => chosen = Some(items[i].0),
+                None => close = true,
+            }
         }
+
         if let Some(action) = chosen {
             if !self.radial_action(ctx, action) {
                 close = true;
@@ -2924,6 +3001,7 @@ impl GeeqApp {
         }
         if close {
             self.radial = None;
+            self.radial_held = false;
         }
     }
 
