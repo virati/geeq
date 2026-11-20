@@ -6,41 +6,42 @@ A minimal, fast, geeqie-style image viewer written in Rust with [egui](https://g
 
 ## Commands
 
-Install (the package is named `cgeeq`, so this installs a `cgeeq` binary):
+Install, then add `cgeeq` as a link to the same binary (once; it keeps
+working across reinstalls):
 
 ```sh
 cargo install --path .
+ln -sf geeq ~/.cargo/bin/cgeeq
 ```
 
 Run:
 
 ```sh
-cgeeq [file-or-folder]
+geeq [file-or-folder]    # full-window picture with the Files panel open
+cgeeq [file-or-folder]   # just the picture
 ```
 
-Run compact (streamlined full-window UI, everything in the right-click radial menu):
-
-```sh
-cargo run --release -- [file-or-folder]
-```
+Both use the same full-window UI: everything else is in the right-click
+radial menu. Press and hold the right button, move toward an item, and let
+go to pick it; a quick right-click leaves the menu open for clicking.
 
 Video mode: add `--video` (or `-V`) to either command.
 
 ## Features
 
-- **Folder navigator + file list** on the left (`.`/`..` entries, hidden-file toggle, recently-active directories weighted by usage)
+- **Folder navigator + file list** on the left, open at start in `geeq` and toggled with Files in the radial menu (`.`/`..` entries, hidden-file toggle, recently-active directories weighted by usage)
 - **Opens on the top photo**: launching geeq or entering a folder opens the folder's first image (or the file you passed on the command line)
 - **Thumbnail grid**: `G` (or Options → Thumbnail grid) swaps the image view for a grid of the whole folder. Arrow keys move between cells, `Enter` or a click opens the photo, and right-click adds it to the clip stack. Turn on Options → *Start in thumbnail grid* to open geeq in the grid every time (saved to `~/.config/geeq/start_in_grid.txt`)
 - **Fast keyboard browsing**: `↑`/`↓` or `[`/`]` step through images, with fast auto-repeat while held
 - **Image view** that fits the available space, with GPU-cheap zoom (scroll wheel or `+`/`-`, centered on the viewport) and drag-to-pan
-- **Display-only rotation** via a bottom bar under the image (doesn't touch the file on disk)
+- **Display-only rotation** via Rotate in the radial menu, 90° per pick (doesn't touch the file on disk)
 - **EXIF**: key fields (date, ISO, shutter speed, f-stop, focal length) shown up front, everything else in a collapsible section
 - **RGB histogram** and a small radial HUD overlay of the current shot's exposure settings
 - **Directory-wide analytics**: a 3-axis exposure phase plot (f-stop / ISO / shutter speed) and a sharpness (Laplacian variance) histogram across every image in the folder, both scanned in the background
 - **Clip stack**: right-click a file (or press `\` on the open image) to add/remove it from a running stack; the stack is copied to the clipboard as shell-quoted paths for pasting into a terminal (`cp`/`mv`/etc.), with a thumbnail popup showing what's queued
 - **Live filters**: load the looks exported from [snaplite](../snaplite) (Looks → Export looks → `snaplite-looks.json`) via Options → Live filters → Load looks. With filter mode on (`F`), toggle looks with the number keys `1`–`9` or the list; they stack in the order switched on and are applied on the fly to every image as you browse. Display-only, like rotation: files on disk are never touched. The pixel pipeline is a Rust port of snaplite's engine; geometry (crop/rotate) isn't part of a look.
 - **Slideshow / screensaver**: `S` (or Options → Slideshow) goes fullscreen and cycles the folder every 3–30 s (default 7, optional shuffle) with the currently selected live filters applied. `Esc`, `S` or a click exits; arrow keys still step manually
-- **Animated GIFs** play in the viewer (pause/play and frame counter in the bottom bar); live filters apply to every frame
+- **Animated GIFs and WebPs** play in the viewer, showing the first frame while the rest decode (Pause in the radial menu, frame counter in the caption); live filters apply to every frame
 - JPEG decoding via libjpeg-turbo (`turbojpeg`); everything else via the `image` crate
 
 ## Running
