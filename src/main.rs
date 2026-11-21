@@ -276,6 +276,25 @@ fn save_video_listing(v: VideoListing) {
     let _ = fs::write(path, text);
 }
 
+/// Whether a file type (PDFs, camera raws) is listed; saved as `1`/`0` in
+/// `~/.config/geeq/<name>`. Missing file means shown.
+fn load_shown(name: &str) -> bool {
+    config_file(name)
+        .and_then(|f| fs::read_to_string(f).ok())
+        .is_none_or(|t| t.trim() != "0")
+}
+
+fn save_shown(name: &str, on: bool) {
+    let Some(path) = config_file(name) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, if on { "1\n" } else { "0\n" });
+}
+
+const SHOW_PDFS_FILE: &str = "show_pdfs.txt";
+const SHOW_RAWS_FILE: &str = "show_raws.txt";
+
 /// Drag-and-drop payload: a file dragged from the list or grid onto a folder.
 struct DraggedFile(PathBuf);
 
@@ -616,6 +635,9 @@ struct GeeqApp {
     /// `--video`: list only videos and always load their previews.
     video_mode: bool,
     video_listing: VideoListing,
+    /// PDFs and camera raws are listed (the PDF / Raw dropdowns).
+    show_pdfs: bool,
+    show_raws: bool,
     video: Option<VideoView>,
     video_tx: mpsc::Sender<VideoMsg>,
     video_rx: mpsc::Receiver<VideoMsg>,
@@ -739,6 +761,8 @@ impl GeeqApp {
             show_dir_stats: photo,
             video_mode,
             video_listing: load_video_listing(),
+            show_pdfs: load_shown(SHOW_PDFS_FILE),
+            show_raws: load_shown(SHOW_RAWS_FILE),
             video: None,
             video_tx,
             video_rx,
@@ -832,6 +856,12 @@ impl GeeqApp {
     fn lists_file(&self, path: &Path) -> bool {
         if self.video_mode {
             return is_video_file(path);
+        }
+        if is_pdf_file(path) {
+            return self.show_pdfs;
+        }
+        if is_raw_file(path) {
+            return self.show_raws;
         }
         is_image_file(path) || (self.video_listing != VideoListing::Hide && is_video_file(path))
     }
@@ -1083,6 +1113,25 @@ impl GeeqApp {
         }
     }
 
+    /// Re-lists after the PDF or Raw setting changes. If the open file is
+    /// now hidden, the first listed file opens instead.
+    fn apply_type_filter(&mut self) {
+        let open = self.selected_file.clone();
+        self.rescan_dir();
+        self.spawn_dir_scans();
+        if let Some(path) = open {
+            if !self.lists_file(&path) {
+                self.loaded = None;
+                self.video = None;
+                self.selected_file = None;
+                self.selected_index = None;
+                if !self.files.is_empty() {
+                    self.open_index(0);
+                }
+            }
+        }
+    }
+
     /// Moves `file` into `dir` (rename, or copy + delete across
     /// filesystems), refusing to overwrite. The clip stack follows the file
     /// to its new path, and if it was the open file the next one opens.
@@ -1170,6 +1219,26 @@ impl GeeqApp {
                 ui.close();
             }
         });
+    }
+
+    /// A Show/Hide dropdown for one file type, next to the Video one.
+    /// Returns true when the setting changed.
+    fn shown_menu(ui: &mut egui::Ui, label: &str, shown: &mut bool, file: &str) -> bool {
+        let state = if *shown { "shown" } else { "hidden" };
+        let mut changed = false;
+        ui.menu_button(format!("{label}: {state} ⏷"), |ui| {
+            for (on, text) in [(true, "Show"), (false, "Hide")] {
+                if ui.radio(*shown == on, text).clicked() {
+                    if *shown != on {
+                        *shown = on;
+                        save_shown(file, on);
+                        changed = true;
+                    }
+                    ui.close();
+                }
+            }
+        });
+        changed
     }
 
     fn clear_clip_stack(&mut self, ctx: &egui::Context) {
@@ -2859,6 +2928,11 @@ impl eframe::App for GeeqApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("Files ({})", self.files.len()));
                     self.video_menu(ui);
+                    let pdf = Self::shown_menu(ui, "📄 PDF", &mut self.show_pdfs, SHOW_PDFS_FILE);
+                    let raw = Self::shown_menu(ui, "📷 Raw", &mut self.show_raws, SHOW_RAWS_FILE);
+                    if pdf || raw {
+                        self.apply_type_filter();
+                    }
                 });
 
                 // File list. Right-click a row to add/remove its path in the

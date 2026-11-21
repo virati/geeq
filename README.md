@@ -31,6 +31,8 @@ clicking. `C`, Options or Full in the radial menu switches to the full UI
 
 Video mode: add `--video` (or `-V`) to either command.
 
+The Files panel header has dropdowns next to the file count: 🎬 Video (hide / list / load previews / videos only), 📄 PDF (show / hide) and 📷 Raw (show / hide). PDF and Raw settings are saved in `~/.config/geeq/show_pdfs.txt` and `show_raws.txt`.
+
 To play the shown video, pick Player in the radial menu or the 🎞 smplayer button above the frame sheet (needs `smplayer` on `PATH`).
 
 ## Features
