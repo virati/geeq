@@ -1832,6 +1832,7 @@ impl GeeqApp {
     /// Left/Right step frames there, Esc or a click goes back to the sheet.
     fn draw_video(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut load = false;
+        let mut play = false;
         let Some(video) = &mut self.video else { return };
         let expected = video.expected();
         ui.horizontal(|ui| {
@@ -1848,7 +1849,14 @@ impl GeeqApp {
             if !video.loading && ui.button("Load preview").clicked() {
                 load = true;
             }
+            if ui.button("🎞 smplayer").on_hover_text("Play this video in smplayer").clicked() {
+                play = true;
+            }
         });
+        if play {
+            self.open_with("smplayer", self.video.as_ref().map(|v| v.path.clone()));
+        }
+        let Some(video) = &mut self.video else { return };
         ui.separator();
         if let Some(err) = &video.error {
             ui.colored_label(Color32::LIGHT_RED, err);
@@ -3044,6 +3052,7 @@ enum RadialAction {
     Up,
     Options,
     FullUi,
+    Player,
     Reader,
 }
 
@@ -3095,6 +3104,9 @@ impl GeeqApp {
             let on = self.clip_stack.contains(path);
             items.push((RadialAction::Clip, "📋\nClip".to_string(), on, "Add/remove this file in the clip stack (\\)"));
         }
+        if self.video.is_some() {
+            items.push((RadialAction::Player, "🎞\nPlayer".to_string(), false, "Play this video in smplayer"));
+        }
         if self.selected_file.as_deref().is_some_and(is_pdf_file) {
             items.push((RadialAction::Reader, "📄\nReader".to_string(), false, "Open this PDF in your PDF reader"));
         }
@@ -3111,16 +3123,17 @@ impl GeeqApp {
         items
     }
 
-    /// Opens the selected file in the desktop's default app (`xdg-open`),
-    /// e.g. the PDF reader. Waited on in the background so it isn't left
-    /// as a zombie.
-    fn open_in_reader(&mut self) {
-        let Some(path) = self.selected_file.clone() else { return };
-        match std::process::Command::new("xdg-open").arg(&path).spawn() {
+    /// Opens a file in another app: smplayer for the shown video, or the
+    /// desktop's default app (`xdg-open`, e.g. the PDF reader) for the
+    /// selected file. Waited on in the background so it isn't left as a
+    /// zombie.
+    fn open_with(&mut self, program: &str, path: Option<PathBuf>) {
+        let Some(path) = path else { return };
+        match std::process::Command::new(program).arg(&path).spawn() {
             Ok(mut child) => {
                 thread::spawn(move || child.wait());
             }
-            Err(e) => self.error = Some(format!("xdg-open: {e}")),
+            Err(e) => self.error = Some(format!("{program}: {e}")),
         }
     }
 
@@ -3171,7 +3184,8 @@ impl GeeqApp {
                     self.toggle_clip_stack(ctx, path);
                 }
             }
-            RadialAction::Reader => self.open_in_reader(),
+            RadialAction::Player => self.open_with("smplayer", self.video.as_ref().map(|v| v.path.clone())),
+            RadialAction::Reader => self.open_with("xdg-open", self.selected_file.clone()),
             RadialAction::Pause => {
                 if let Some(anim) = self.loaded.as_mut().and_then(|l| l.anim.as_mut()) {
                     anim.paused = !anim.paused;
@@ -3423,7 +3437,7 @@ impl GeeqApp {
                     self.show_info_panel = !self.show_info_panel;
                 }
                 if open_reader {
-                    self.open_in_reader();
+                    self.open_with("xdg-open", self.selected_file.clone());
                 }
                 ui.separator();
 
