@@ -227,7 +227,11 @@ fn has_extension(path: &Path, list: &[&str]) -> bool {
 }
 
 fn is_image_file(path: &Path) -> bool {
-    has_extension(path, IMAGE_EXTENSIONS) || is_raw_file(path)
+    has_extension(path, IMAGE_EXTENSIONS) || is_raw_file(path) || is_pdf_file(path)
+}
+
+fn is_pdf_file(path: &Path) -> bool {
+    has_extension(path, &["pdf"])
 }
 
 fn is_raw_file(path: &Path) -> bool {
@@ -338,7 +342,12 @@ fn make_thumbnail(path: &Path) -> Option<ColorImage> {
         let info = probe_video(path).ok()?;
         return video_frame(path, info.duration * 0.1, THUMB_SIZE).ok();
     }
-    let rgba = decode_to_rgba(path).ok()?;
+    // Render PDFs at thumbnail size instead of the full preview.
+    let rgba = if is_pdf_file(path) {
+        render_pdf_pages(path, THUMB_SIZE).ok()?
+    } else {
+        decode_to_rgba(path).ok()?
+    };
     let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(THUMB_SIZE, THUMB_SIZE).to_rgba8();
     let (w, h) = (thumb.width() as usize, thumb.height() as usize);
     Some(ColorImage::from_rgba_unmultiplied([w, h], thumb.as_raw()))
@@ -891,7 +900,9 @@ impl GeeqApp {
         self.exposure_points.clear();
         self.sharpness_points.clear();
         let gen = self.dir_generation;
-        let images: Vec<PathBuf> = self.files.iter().filter(|p| is_image_file(p)).cloned().collect();
+        // Documents have no exposure and their sharpness means nothing.
+        let images: Vec<PathBuf> =
+            self.files.iter().filter(|p| is_image_file(p) && !is_pdf_file(p)).cloned().collect();
 
         let exposure_files = images.clone();
         let exposure_tx = self.exposure_tx.clone();
@@ -2052,9 +2063,51 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
             .map_err(|e| e.to_string());
     }
 
+    if is_pdf_file(path) {
+        return render_pdf_pages(path, PDF_PREVIEW_HEIGHT);
+    }
+
     image::open(path)
         .map(|img| img.to_rgba8())
         .map_err(|e| e.to_string())
+}
+
+/// Page height of the PDF preview: screen-sized, not print-sized, so it
+/// renders fast and still has headroom to zoom.
+const PDF_PREVIEW_HEIGHT: u32 = 1400;
+
+/// Pages 1 and 2 of a PDF side by side, each `height` px tall (just page 1
+/// for a one-page PDF). Each page is a poppler `pdftoppm` run, both at once,
+/// writing PPM straight to memory.
+fn render_pdf_pages(path: &Path, height: u32) -> Result<image::RgbaImage, String> {
+    let render = |page: &str| {
+        let out = std::process::Command::new("pdftoppm")
+            .args(["-f", page, "-l", page, "-singlefile", "-scale-to-x", "-1"])
+            .args(["-scale-to-y", &height.to_string()])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("pdftoppm: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        image::load_from_memory_with_format(&out.stdout, image::ImageFormat::Pnm)
+            .map(|img| img.to_rgba8())
+            .map_err(|e| e.to_string())
+    };
+    let (first, second) = thread::scope(|s| {
+        let second = s.spawn(|| render("2"));
+        (render("1"), second.join().unwrap())
+    });
+    let first = first?;
+    let Ok(second) = second else { return Ok(first) };
+    let gap = (height / 40).max(2);
+    let mut both = image::RgbaImage::new(
+        first.width() + gap + second.width(),
+        first.height().max(second.height()),
+    );
+    image::imageops::replace(&mut both, &first, 0, 0);
+    image::imageops::replace(&mut both, &second, (first.width() + gap) as i64, 0);
+    Ok(both)
 }
 
 /// The frames of an animated GIF or WebP, composited to the full canvas.
@@ -3792,6 +3845,40 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod gif_tests {
     use super::*;
+
+    /// A minimal PDF of `pages` blank 200x100 pt pages (poppler rebuilds
+    /// the missing xref table).
+    fn write_pdf(path: &Path, pages: usize) {
+        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", i + 3)).collect();
+        let mut pdf = format!(
+            "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+             2 0 obj << /Type /Pages /Kids [{}] /Count {pages} >> endobj\n",
+            kids.join(" ")
+        );
+        for i in 0..pages {
+            pdf += &format!(
+                "{} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >> endobj\n",
+                i + 3
+            );
+        }
+        pdf += "trailer << /Root 1 0 R >>\n%%EOF\n";
+        fs::write(path, pdf).unwrap();
+    }
+
+    #[test]
+    fn pdf_preview_shows_first_two_pages_side_by_side() {
+        let dir = std::env::temp_dir();
+        let three = dir.join("geeq-test-3pages.pdf");
+        write_pdf(&three, 3);
+        let img = render_pdf_pages(&three, 50).unwrap();
+        // Two 100x50 pages and a 2 px gap; page 3 is left out.
+        assert_eq!((img.width(), img.height()), (202, 50));
+
+        let one = dir.join("geeq-test-1page.pdf");
+        write_pdf(&one, 1);
+        let img = render_pdf_pages(&one, 50).unwrap();
+        assert_eq!((img.width(), img.height()), (100, 50));
+    }
 
     /// Set GEEQ_TEST_RAW to a camera raw/DNG path to exercise the raw decoder.
     #[test]
