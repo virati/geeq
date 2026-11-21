@@ -620,8 +620,12 @@ struct GeeqApp {
     video_tx: mpsc::Sender<VideoMsg>,
     video_rx: mpsc::Receiver<VideoMsg>,
     /// Generation the preview workers check so a superseded video stops
-    /// spawning ffmpeg processes.
+    /// spawning ffmpeg processes (and preloading stops for a file left).
     video_gen: Arc<AtomicU64>,
+    /// Decoded originals of the shown file and its neighbours, filled in
+    /// the background after each load so stepping to the next file skips
+    /// the decode.
+    preloaded: Arc<Mutex<HashMap<PathBuf, Arc<image::RgbaImage>>>>,
 }
 
 impl GeeqApp {
@@ -735,6 +739,7 @@ impl GeeqApp {
             video_tx,
             video_rx,
             video_gen: Arc::new(AtomicU64::new(0)),
+            preloaded: Arc::new(Mutex::new(HashMap::new())),
         };
         if let Some(path) = looks_path_file()
             .and_then(|f| fs::read_to_string(f).ok())
@@ -1194,6 +1199,23 @@ impl GeeqApp {
         });
         self.filtering = false;
 
+        // Still images either side, decoded after this one; the cache keeps
+        // only this file and those.
+        let neighbours: Vec<PathBuf> = self
+            .selected_index
+            .into_iter()
+            .flat_map(|i| [i + 1, i.wrapping_sub(1)])
+            .filter_map(|i| self.files.get(i))
+            .filter(|p| is_image_file(p) && !has_extension(p, &["gif", "webp"]))
+            .cloned()
+            .collect();
+        let preloaded = Arc::clone(&self.preloaded);
+        preloaded
+            .lock()
+            .unwrap()
+            .retain(|p, _| *p == path || neighbours.contains(p));
+        let current = Arc::clone(&self.video_gen);
+
         let decode_tx = self.load_tx.clone();
         let decode_path = path.clone();
         let rev = self.filter_rev;
@@ -1205,10 +1227,15 @@ impl GeeqApp {
             // ordinary still-image path.
             let mut anim = anim_frames(&decode_path);
             let first = anim.as_mut().and_then(|it| it.next()).and_then(|f| f.ok()).map(frame_with_delay);
-            let decoded = match &first {
-                Some((img, _)) => Ok(Arc::new(img.clone())),
-                None => decode_to_rgba(&decode_path).map(Arc::new),
+            let cached = preloaded.lock().unwrap().get(&decode_path).cloned();
+            let decoded = match (&first, cached) {
+                (Some((img, _)), _) => Ok(Arc::new(img.clone())),
+                (None, Some(rgba)) => Ok(rgba),
+                (None, None) => decode_to_rgba(&decode_path).map(Arc::new),
             };
+            if let (None, Ok(rgba)) = (&first, &decoded) {
+                preloaded.lock().unwrap().insert(decode_path.clone(), Arc::clone(rgba));
+            }
             match decoded {
                 Ok(rgba) => {
                     let _ = decode_tx.send(LoadMsg::Original(gen, rev, decode_path.clone(), rgba.clone()));
@@ -1231,6 +1258,19 @@ impl GeeqApp {
                         "Failed to open {}: {err}",
                         decode_path.file_name().unwrap_or_default().to_string_lossy()
                     )));
+                }
+            }
+            for p in neighbours {
+                // Moved on (e.g. holding an arrow key): leave it to the
+                // newer load.
+                if current.load(Ordering::Relaxed) != gen {
+                    return;
+                }
+                if preloaded.lock().unwrap().contains_key(&p) {
+                    continue;
+                }
+                if let Ok(rgba) = decode_to_rgba(&p) {
+                    preloaded.lock().unwrap().insert(p, Arc::new(rgba));
                 }
             }
         });
