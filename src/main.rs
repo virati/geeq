@@ -51,25 +51,6 @@ fn save_start_in_grid(on: bool) {
     let _ = fs::write(path, if on { "1\n" } else { "0\n" });
 }
 
-/// Whether the compact (full-window picture, radial menu) UI is on.
-fn compact_file() -> Option<PathBuf> {
-    config_file("compact.txt")
-}
-
-fn load_compact() -> bool {
-    compact_file()
-        .and_then(|f| fs::read_to_string(f).ok())
-        .is_some_and(|t| t.trim() == "1")
-}
-
-fn save_compact(on: bool) {
-    let Some(path) = compact_file() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let _ = fs::write(path, if on { "1\n" } else { "0\n" });
-}
-
 fn load_dir_activity() -> HashMap<PathBuf, u32> {
     let mut map = HashMap::new();
     let Some(path) = recent_dirs_file() else { return map };
@@ -270,13 +251,11 @@ fn videos_file() -> Option<PathBuf> {
     config_file("videos.txt")
 }
 
-fn load_video_listing(compact: bool) -> VideoListing {
+fn load_video_listing() -> VideoListing {
     match videos_file().and_then(|f| fs::read_to_string(f).ok()).as_deref().map(str::trim) {
         Some("hide") => VideoListing::Hide,
         Some("list") => VideoListing::List,
-        Some("load") => VideoListing::Load,
-        _ if compact => VideoListing::Load,
-        _ => VideoListing::List,
+        _ => VideoListing::Load,
     }
 }
 
@@ -603,13 +582,20 @@ struct GeeqApp {
     grid_mode: bool,
     /// Compact UI: the picture fills the window and everything else is
     /// reached through the right-click radial menu. Off is the full layout.
+    /// geeq and cgeeq start compact, pgeeq full.
     compact: bool,
-    /// Persisted setting (full UI): open in grid mode.
+    /// Persisted setting: open in grid mode.
     start_in_grid: bool,
-    /// Left folder/file panel (always on in the full UI).
+    /// Left folder/file panel: shut at start only for cgeeq; always on in
+    /// the full UI.
     show_nav_panel: bool,
     /// Where the right-click radial menu is open, if it is.
     radial: Option<egui::Pos2>,
+    /// The right button that opened the radial menu is still down:
+    /// releasing it picks the slot under the pointer.
+    radial_held: bool,
+    /// The held pointer has left the center, so releasing back there cancels.
+    radial_moved: bool,
     /// Columns in the grid as last laid out, so Up/Down can move by a row.
     grid_cols: usize,
     /// Scroll the grid to the selected cell on the next frame.
@@ -630,7 +616,8 @@ struct GeeqApp {
 }
 
 impl GeeqApp {
-    fn new(start_path: Option<PathBuf>, video_mode: bool) -> Self {
+    fn new(start_path: Option<PathBuf>, video_mode: bool, launch: &str) -> Self {
+        let photo = launch == "pgeeq";
         let start_path = start_path.map(|p| fs::canonicalize(&p).unwrap_or(p));
         let start_file = start_path.clone().filter(|p| p.is_file());
         let start_dir = start_path
@@ -669,8 +656,7 @@ impl GeeqApp {
                 }
             });
         }
-        let compact = load_compact();
-        let start_in_grid = !compact && load_start_in_grid();
+        let start_in_grid = load_start_in_grid();
         let (video_tx, video_rx) = mpsc::channel();
 
         let mut app = Self {
@@ -686,7 +672,7 @@ impl GeeqApp {
             nav_next_repeat_at: 0.0,
             show_options: false,
             show_hidden: false,
-            show_info_panel: !compact,
+            show_info_panel: photo,
             zoom: 1.0,
             image_scroll_reset: true,
             wheel_accum: 0.0,
@@ -724,16 +710,18 @@ impl GeeqApp {
             thumb_jobs,
             thumb_gen,
             grid_mode: start_in_grid,
-            compact,
+            compact: !photo,
             start_in_grid,
-            show_nav_panel: !compact,
+            show_nav_panel: launch != "cgeeq",
             radial: None,
+            radial_held: false,
+            radial_moved: false,
             grid_cols: 1,
             grid_scroll_pending: true,
             list_scroll_pending: false,
-            show_dir_stats: false,
+            show_dir_stats: photo,
             video_mode,
-            video_listing: load_video_listing(compact),
+            video_listing: load_video_listing(),
             video: None,
             video_tx,
             video_rx,
@@ -1656,7 +1644,11 @@ impl GeeqApp {
 
         let mut area = egui::ScrollArea::vertical()
             .id_salt("grid_scroll")
-            .auto_shrink([false, false]);
+            .auto_shrink([false, false])
+            .scroll_source(egui::containers::scroll_area::ScrollSource {
+                drag: self.drag_pans(ctx),
+                ..Default::default()
+            });
         if self.grid_scroll_pending {
             self.grid_scroll_pending = false;
             if let Some(idx) = self.selected_index {
@@ -1675,6 +1667,7 @@ impl GeeqApp {
         let loads_videos = self.loads_videos();
         let mut clicked = None;
         let mut clipped = None;
+        let mut cell_hovered = false;
         let output = area.show_rows(ui, row_h, rows, |ui, range| {
             for r in range {
                 ui.horizontal(|ui| {
@@ -1751,6 +1744,9 @@ impl GeeqApp {
                         if resp.secondary_clicked() {
                             clipped = Some(path);
                         }
+                        if resp.hovered() {
+                            cell_hovered = true;
+                        }
                     }
                 });
             }
@@ -1763,7 +1759,9 @@ impl GeeqApp {
             }
             self.grid_mode = false;
         }
-        let right_click_used = clipped.is_some();
+        // A right press on a cell is for clipping, not the radial menu.
+        let right_click_used =
+            clipped.is_some() || (cell_hovered && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)));
         if let Some(path) = clipped {
             self.toggle_clip_stack(ctx, path);
         }
@@ -2189,7 +2187,7 @@ fn camera_name(exif_data: &exif::Exif) -> Option<String> {
 /// EXIF for camera raws whose container `kamadak-exif` can't walk (RW2, RAF,
 /// CR3, ...), via rawler's own metadata decode.
 fn raw_metadata(path: &Path) -> Option<rawler::decoders::RawMetadata> {
-    use rawler::decoders::{Decoder, RawDecodeParams};
+    use rawler::decoders::RawDecodeParams;
     let src = rawler::rawsource::RawSource::new(path).ok()?;
     let decoder = rawler::get_decoder(&src).ok()?;
     decoder.raw_metadata(&src, &RawDecodeParams::default()).ok()
@@ -2315,6 +2313,7 @@ impl eframe::App for GeeqApp {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.radial = None;
+            self.radial_held = false;
         }
         self.handle_nav_keys(ctx);
         self.drain_load_messages(ctx);
@@ -2473,11 +2472,10 @@ impl eframe::App for GeeqApp {
                     self.grid_scroll_pending = true;
                 }
 
-                if !self.compact
-                    && ui
-                        .checkbox(&mut self.start_in_grid, "Start in thumbnail grid")
-                        .on_hover_text("Open geeq on the folder's thumbnail grid instead of the top photo")
-                        .changed()
+                if ui
+                    .checkbox(&mut self.start_in_grid, "Start in thumbnail grid")
+                    .on_hover_text("Open geeq on the folder's thumbnail grid instead of the top photo")
+                    .changed()
                 {
                     save_start_in_grid(self.start_in_grid);
                 }
@@ -2877,12 +2875,14 @@ impl eframe::App for GeeqApp {
 
             let opens_radial = self.compact
                 && !right_click_used
-                && ui.input(|i| i.pointer.secondary_clicked())
+                && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary))
                 && ui
                     .input(|i| i.pointer.interact_pos())
                     .is_some_and(|p| central_rect.contains(p) && ctx.layer_id_at(p) == Some(ui.layer_id()));
             if opens_radial {
                 self.radial = ui.input(|i| i.pointer.interact_pos());
+                self.radial_held = true;
+                self.radial_moved = false;
             }
         });
 
@@ -2912,16 +2912,18 @@ enum RadialAction {
 /// Distance from the menu's center to each slot, and each slot's radius.
 const RADIAL_RING: f32 = 112.0;
 const RADIAL_ITEM: f32 = 33.0;
+/// Pointer within this of the center highlights nothing (the ✕).
+const RADIAL_CENTER: f32 = 22.0;
 
 impl GeeqApp {
     /// Switches between the full and compact UI, resetting the panels to
-    /// that mode's layout, and remembers the choice.
+    /// that mode's layout.
     fn set_compact(&mut self, compact: bool) {
         self.compact = compact;
         self.show_nav_panel = !compact;
         self.show_info_panel = !compact;
         self.radial = None;
-        save_compact(compact);
+        self.radial_held = false;
     }
 
     /// The radial menu's slots, clockwise from the top: action, label,
@@ -3033,9 +3035,22 @@ impl GeeqApp {
         false
     }
 
-    /// The right-click radial menu: a ring of round buttons around where
-    /// the click landed, kept fully on screen. A click outside the ring,
-    /// the center ✕ or Esc closes it.
+    /// Whether a drag may pan the picture pane. egui pans on a drag with
+    /// any button, but the right button belongs to the radial menu (and
+    /// to clipping grid cells): no panning while it is down, on the frame
+    /// it lets go (egui would fling the pane), or while the menu is open.
+    fn drag_pans(&self, ctx: &egui::Context) -> bool {
+        self.radial.is_none()
+            && !ctx.input(|i| {
+                i.pointer.secondary_down() || i.pointer.button_released(egui::PointerButton::Secondary)
+            })
+    }
+
+    /// The right-click radial menu: a hazy ring of labels around where the
+    /// right button went down, kept fully on screen. Hold the button, move
+    /// toward a label to highlight it, release to pick it; release in the
+    /// middle (without having left it) keeps the menu open for clicking.
+    /// A click outside the ring, the center ✕ or Esc closes it.
     fn show_radial(&mut self, ctx: &egui::Context) {
         let Some(center) = self.radial else { return };
         let items = self.radial_items();
@@ -3047,66 +3062,123 @@ impl GeeqApp {
         );
         self.radial = Some(center);
 
-        let mut chosen = None;
-        let mut close = false;
+        let n = items.len();
+        let slot_angle = |i: usize| -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n as f32;
+        // Highlight by direction, like a pie: anywhere past the ✕ counts,
+        // so a short flick toward a label is enough.
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let in_center = pointer.is_none_or(|p| p.distance(center) <= RADIAL_CENTER);
+        let highlight = pointer.filter(|_| !in_center).map(|p| {
+            let d = p - center;
+            let turn = (d.y.atan2(d.x) + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU);
+            (turn / std::f32::consts::TAU * n as f32).round() as usize % n
+        });
+        if self.radial_held && !in_center {
+            self.radial_moved = true;
+        }
+
         egui::Area::new(egui::Id::new("geeq_radial"))
             .order(egui::Order::Foreground)
             .fixed_pos(center - egui::Vec2::splat(outer))
             .show(ctx, |ui| {
-                // Swallows clicks on the disc between slots.
-                ui.allocate_exact_size(egui::Vec2::splat(outer * 2.0), egui::Sense::click());
+                // Swallows clicks and drags on the disc.
+                ui.allocate_exact_size(egui::Vec2::splat(outer * 2.0), egui::Sense::click_and_drag());
                 let painter = ui.painter();
-                painter.circle_filled(center, outer, Color32::from_black_alpha(170));
 
-                let n = items.len();
-                for (i, (action, label, on, hint)) in items.iter().enumerate() {
-                    let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n as f32;
-                    let pos = center + RADIAL_RING * egui::vec2(angle.cos(), angle.sin());
-                    let slot = egui::Rect::from_center_size(pos, egui::Vec2::splat(RADIAL_ITEM * 2.0));
-                    let resp = ui
-                        .interact(slot, egui::Id::new(("geeq_radial_slot", i)), egui::Sense::click())
-                        .on_hover_text(*hint);
-                    let fill = if resp.hovered() {
-                        ui.visuals().selection.bg_fill
-                    } else if *on {
-                        Color32::from_rgb(52, 78, 112)
-                    } else {
-                        Color32::from_gray(42)
-                    };
-                    painter.circle_filled(pos, RADIAL_ITEM, fill);
-                    if *on {
-                        painter.circle_stroke(pos, RADIAL_ITEM, egui::Stroke::new(1.5, Color32::from_rgb(120, 170, 230)));
-                    }
-                    painter.text(
-                        pos,
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(12.0),
-                        Color32::WHITE,
-                    );
-                    if resp.clicked() {
-                        chosen = Some(*action);
-                    }
+                // Hazy ring: dark at the label circle, fading to clear on
+                // both sides.
+                let half = RADIAL_ITEM + 14.0;
+                let mut r = RADIAL_RING - half;
+                while r <= RADIAL_RING + half {
+                    let t = 1.0 - ((r - RADIAL_RING).abs() / half);
+                    let alpha = (150.0 * t * t) as u8;
+                    painter.circle_stroke(center, r, egui::Stroke::new(2.5, Color32::from_black_alpha(alpha)));
+                    r += 2.0;
                 }
 
-                let close_rect = egui::Rect::from_center_size(center, egui::Vec2::splat(40.0));
-                let close_resp = ui
-                    .interact(close_rect, egui::Id::new("geeq_radial_close"), egui::Sense::click())
-                    .on_hover_text("Close (Esc)");
-                let fill = if close_resp.hovered() { Color32::from_gray(80) } else { Color32::from_gray(55) };
-                painter.circle_filled(center, 20.0, fill);
-                painter.text(center, egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(16.0), Color32::WHITE);
-                if close_resp.clicked() {
-                    close = true;
+                for (i, (_, label, on, _)) in items.iter().enumerate() {
+                    let angle = slot_angle(i);
+                    let pos = center + RADIAL_RING * egui::vec2(angle.cos(), angle.sin());
+                    let color = if *on { Color32::from_rgb(140, 195, 255) } else { Color32::WHITE };
+                    let galley = painter.layout(
+                        label.clone(),
+                        egui::FontId::proportional(13.0),
+                        color,
+                        f32::INFINITY,
+                    );
+                    let text_rect = egui::Align2::CENTER_CENTER.anchor_size(pos, galley.size());
+                    if highlight == Some(i) {
+                        let box_rect = text_rect.expand2(egui::vec2(8.0, 4.0));
+                        painter.rect_filled(box_rect, 6.0, Color32::from_white_alpha(28));
+                        painter.rect_stroke(
+                            box_rect,
+                            6.0,
+                            egui::Stroke::new(1.5, Color32::WHITE),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    // Dark outline keeps the text readable on bright photos.
+                    for off in [egui::vec2(1.0, 1.0), egui::vec2(-1.0, 1.0), egui::vec2(1.0, -1.0), egui::vec2(-1.0, -1.0)] {
+                        painter.galley_with_override_text_color(
+                            text_rect.min + off,
+                            galley.clone(),
+                            Color32::from_black_alpha(200),
+                        );
+                    }
+                    painter.galley(text_rect.min, galley, color);
+                }
+
+                let fill = if in_center && pointer.is_some() { Color32::from_black_alpha(190) } else { Color32::from_black_alpha(120) };
+                painter.circle_filled(center, 16.0, fill);
+                painter.text(center, egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(15.0), Color32::WHITE);
+
+                // What the highlighted slot does, under (or above) the ring.
+                if let Some(i) = highlight {
+                    let below = center.y + outer + 24.0 < screen.bottom();
+                    let (at, align) = if below {
+                        (center + egui::vec2(0.0, outer + 4.0), egui::Align2::CENTER_TOP)
+                    } else {
+                        (center - egui::vec2(0.0, outer + 4.0), egui::Align2::CENTER_BOTTOM)
+                    };
+                    let galley = painter.layout_no_wrap(items[i].3.to_string(), egui::FontId::proportional(12.0), Color32::WHITE);
+                    let rect = align.anchor_size(at, galley.size());
+                    painter.rect_filled(rect.expand2(egui::vec2(6.0, 3.0)), 4.0, Color32::from_black_alpha(170));
+                    painter.galley(rect.min, galley, Color32::WHITE);
                 }
             });
 
-        let pressed_outside = ctx.input(|i| {
-            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| p.distance(center) > outer)
+        let (sec_released, sec_pressed, prim_clicked, pressed_outside) = ctx.input(|i| {
+            (
+                i.pointer.button_released(egui::PointerButton::Secondary),
+                i.pointer.button_pressed(egui::PointerButton::Secondary),
+                i.pointer.button_clicked(egui::PointerButton::Primary),
+                i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| p.distance(center) > outer),
+            )
         });
-        if pressed_outside {
-            close = true;
+
+        let mut chosen = None;
+        let mut close = pressed_outside;
+        if self.radial_held {
+            if sec_released {
+                self.radial_held = false;
+                match highlight {
+                    Some(i) => chosen = Some(items[i].0),
+                    // Back in the middle after moving out: cancel. A plain
+                    // right-click stays open for clicking.
+                    None => close = self.radial_moved,
+                }
+            }
+        } else if sec_pressed && !pressed_outside {
+            // Right press on an open menu starts a new hold.
+            self.radial_held = true;
+            self.radial_moved = false;
+        } else if prim_clicked && !pressed_outside {
+            match highlight {
+                Some(i) => chosen = Some(items[i].0),
+                None => close = true,
+            }
         }
+
         if let Some(action) = chosen {
             if !self.radial_action(ctx, action) {
                 close = true;
@@ -3114,6 +3186,7 @@ impl GeeqApp {
         }
         if close {
             self.radial = None;
+            self.radial_held = false;
         }
     }
 
@@ -3347,6 +3420,7 @@ impl GeeqApp {
                         .auto_shrink([false, false])
                         .scroll_source(egui::containers::scroll_area::ScrollSource {
                             mouse_wheel: false,
+                            drag: self.drag_pans(ctx),
                             ..Default::default()
                         });
                     if std::mem::take(&mut self.image_scroll_reset) {
@@ -3692,6 +3766,14 @@ fn draw_histogram(ui: &mut egui::Ui, hist: &Histogram) {
 fn main() -> eframe::Result<()> {
     // `--video` (or `-V`): list only videos and show their frame previews.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The name it was started as picks the layout: geeq is compact with
+    // the Files panel, cgeeq (a link to geeq) just the picture, pgeeq (a
+    // link) the full photography UI with EXIF and plots. argv[0], since
+    // current_exe() resolves a link back to geeq.
+    let launch = std::env::args()
+        .next()
+        .and_then(|a| Some(Path::new(&a).file_stem()?.to_string_lossy().into_owned()))
+        .unwrap_or_default();
     let video_mode = args.iter().any(|a| a == "--video" || a == "-V");
     let start_path = args.iter().find(|a| !a.starts_with('-')).map(PathBuf::from);
 
@@ -3703,7 +3785,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         if video_mode { "geeq (video mode)" } else { "geeq" },
         options,
-        Box::new(|_cc| Ok(Box::new(GeeqApp::new(start_path, video_mode)))),
+        Box::new(|_cc| Ok(Box::new(GeeqApp::new(start_path, video_mode, &launch)))),
     )
 }
 
