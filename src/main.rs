@@ -292,6 +292,49 @@ fn save_shown(name: &str, on: bool) {
     let _ = fs::write(path, if on { "1\n" } else { "0\n" });
 }
 
+/// File list order, cycled by the sort button: name (A→Z), time (newest
+/// first), size (largest first). Folders always list by name.
+#[derive(Clone, Copy, PartialEq)]
+enum SortBy {
+    Name,
+    Time,
+    Size,
+}
+
+impl SortBy {
+    fn next(self) -> Self {
+        match self {
+            SortBy::Name => SortBy::Time,
+            SortBy::Time => SortBy::Size,
+            SortBy::Size => SortBy::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SortBy::Name => "name",
+            SortBy::Time => "time",
+            SortBy::Size => "size",
+        }
+    }
+}
+
+fn load_sort_by() -> SortBy {
+    match config_file("sort.txt").and_then(|f| fs::read_to_string(f).ok()).as_deref().map(str::trim) {
+        Some("time") => SortBy::Time,
+        Some("size") => SortBy::Size,
+        _ => SortBy::Name,
+    }
+}
+
+fn save_sort_by(v: SortBy) {
+    let Some(path) = config_file("sort.txt") else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, format!("{}\n", v.label()));
+}
+
 const SHOW_PDFS_FILE: &str = "show_pdfs.txt";
 const SHOW_RAWS_FILE: &str = "show_raws.txt";
 
@@ -638,6 +681,7 @@ struct GeeqApp {
     /// PDFs and camera raws are listed (the PDF / Raw dropdowns).
     show_pdfs: bool,
     show_raws: bool,
+    sort_by: SortBy,
     video: Option<VideoView>,
     video_tx: mpsc::Sender<VideoMsg>,
     video_rx: mpsc::Receiver<VideoMsg>,
@@ -763,6 +807,7 @@ impl GeeqApp {
             video_listing: load_video_listing(),
             show_pdfs: load_shown(SHOW_PDFS_FILE),
             show_raws: load_shown(SHOW_RAWS_FILE),
+            sort_by: load_sort_by(),
             video: None,
             video_tx,
             video_rx,
@@ -902,6 +947,16 @@ impl GeeqApp {
             .sort_by_key(|p| p.file_name().unwrap_or_default().to_ascii_lowercase());
         self.files
             .sort_by_key(|p| p.file_name().unwrap_or_default().to_ascii_lowercase());
+        // Stable sorts, so equal times/sizes stay in name order.
+        match self.sort_by {
+            SortBy::Name => {}
+            SortBy::Time => self.files.sort_by_cached_key(|p| {
+                std::cmp::Reverse(fs::metadata(p).and_then(|m| m.modified()).ok())
+            }),
+            SortBy::Size => self.files.sort_by_cached_key(|p| {
+                std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            }),
+        }
 
         self.path_input = self.current_dir.display().to_string();
 
@@ -1111,6 +1166,16 @@ impl GeeqApp {
             None if self.video.is_some() => self.video = None,
             _ => {}
         }
+    }
+
+    /// Moves to the next sort order and re-lists, keeping the open file
+    /// selected and scrolled into view.
+    fn cycle_sort(&mut self) {
+        self.sort_by = self.sort_by.next();
+        save_sort_by(self.sort_by);
+        self.rescan_dir();
+        self.list_scroll_pending = true;
+        self.grid_scroll_pending = true;
     }
 
     /// Re-lists after the PDF or Raw setting changes. If the open file is
@@ -2933,6 +2998,13 @@ impl eframe::App for GeeqApp {
                     if pdf || raw {
                         self.apply_type_filter();
                     }
+                    if ui
+                        .button(format!("⇅ {}", self.sort_by.label()))
+                        .on_hover_text("Sort files: name → time (newest first) → size (largest first)")
+                        .clicked()
+                    {
+                        self.cycle_sort();
+                    }
                 });
 
                 // File list. Right-click a row to add/remove its path in the
@@ -3116,6 +3188,7 @@ enum RadialAction {
     Info,
     Plots,
     Video,
+    Sort,
     Grid,
     Filters,
     Slideshow,
@@ -3168,6 +3241,12 @@ impl GeeqApp {
                 format!("🎬\n{video}"),
                 self.video_mode || self.video_listing != VideoListing::Hide,
                 "Video mode: hide → list → load previews → videos only",
+            ),
+            (
+                RadialAction::Sort,
+                format!("⇅\n{}", self.sort_by.label()),
+                self.sort_by != SortBy::Name,
+                "Sort files: name → time → size",
             ),
             (RadialAction::Grid, "▦\nGrid".to_string(), self.grid_mode, "Thumbnail grid (G)"),
             (RadialAction::Filters, "✨\nFilters".to_string(), self.filter_mode, "Live looks filters (F); pick looks in Options"),
@@ -3237,6 +3316,10 @@ impl GeeqApp {
                     save_video_listing(next);
                 }
                 self.apply_video_settings();
+                return true;
+            }
+            RadialAction::Sort => {
+                self.cycle_sort();
                 return true;
             }
             RadialAction::Grid => {
