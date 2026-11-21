@@ -3044,6 +3044,7 @@ enum RadialAction {
     Up,
     Options,
     FullUi,
+    Reader,
 }
 
 /// Distance from the menu's center to each slot, and each slot's radius.
@@ -3094,6 +3095,9 @@ impl GeeqApp {
             let on = self.clip_stack.contains(path);
             items.push((RadialAction::Clip, "📋\nClip".to_string(), on, "Add/remove this file in the clip stack (\\)"));
         }
+        if self.selected_file.as_deref().is_some_and(is_pdf_file) {
+            items.push((RadialAction::Reader, "📄\nReader".to_string(), false, "Open this PDF in your PDF reader"));
+        }
         if let Some(anim) = self.loaded.as_ref().and_then(|l| l.anim.as_ref()) {
             let label = if anim.paused { "▶\nPlay" } else { "⏸\nPause" };
             items.push((RadialAction::Pause, label.to_string(), anim.paused, "Pause / play the animation"));
@@ -3105,6 +3109,19 @@ impl GeeqApp {
             (RadialAction::Options, "⚙\nOptions".to_string(), self.show_options, "Options panel: looks, slideshow, recent folders"),
         ]);
         items
+    }
+
+    /// Opens the selected file in the desktop's default app (`xdg-open`),
+    /// e.g. the PDF reader. Waited on in the background so it isn't left
+    /// as a zombie.
+    fn open_in_reader(&mut self) {
+        let Some(path) = self.selected_file.clone() else { return };
+        match std::process::Command::new("xdg-open").arg(&path).spawn() {
+            Ok(mut child) => {
+                thread::spawn(move || child.wait());
+            }
+            Err(e) => self.error = Some(format!("xdg-open: {e}")),
+        }
     }
 
     /// Runs a radial menu action. Returns true if the menu should stay
@@ -3154,6 +3171,7 @@ impl GeeqApp {
                     self.toggle_clip_stack(ctx, path);
                 }
             }
+            RadialAction::Reader => self.open_in_reader(),
             RadialAction::Pause => {
                 if let Some(anim) = self.loaded.as_mut().and_then(|l| l.anim.as_mut()) {
                     anim.paused = !anim.paused;
@@ -3363,6 +3381,7 @@ impl GeeqApp {
 
             if !self.compact {
                 let mut toggle_info_panel = false;
+                let mut open_reader = false;
                 {
                     let loaded = self.loaded.as_ref().unwrap();
                     ui.horizontal(|ui| {
@@ -3392,11 +3411,19 @@ impl GeeqApp {
                             {
                                 toggle_info_panel = true;
                             }
+                            if is_pdf_file(&loaded.path)
+                                && ui.button("📄 Reader").on_hover_text("Open this PDF in your PDF reader").clicked()
+                            {
+                                open_reader = true;
+                            }
                         });
                     });
                 }
                 if toggle_info_panel {
                     self.show_info_panel = !self.show_info_panel;
+                }
+                if open_reader {
+                    self.open_in_reader();
                 }
                 ui.separator();
 
