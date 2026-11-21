@@ -322,10 +322,23 @@ fn probe_video(path: &Path) -> Result<VideoInfo, String> {
 /// One frame at `secs`, scaled to `width` wide. Input-side seeking jumps to
 /// the nearest keyframe first, so this stays fast even deep into a file.
 fn video_frame(path: &Path, secs: f64, width: u32) -> Result<ColorImage, String> {
+    video_frame_vf(path, secs, &format!("scale={width}:-2"))
+}
+
+/// The same frame as `video_frame` at the video's own resolution, shrunk
+/// only if a side is over `max_side` (the GPU's texture limit).
+fn video_frame_full(path: &Path, secs: f64, max_side: usize) -> Result<ColorImage, String> {
+    let vf = format!(
+        "scale='min(iw,{max_side})':'min(ih,{max_side})':force_original_aspect_ratio=decrease"
+    );
+    video_frame_vf(path, secs, &vf)
+}
+
+fn video_frame_vf(path: &Path, secs: f64, vf: &str) -> Result<ColorImage, String> {
     let out = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-ss", &format!("{secs:.3}"), "-i"])
         .arg(path)
-        .args(["-frames:v", "1", "-an", "-sn", "-vf", &format!("scale={width}:-2")])
+        .args(["-frames:v", "1", "-an", "-sn", "-vf", vf])
         .args(["-f", "image2pipe", "-c:v", "ppm", "-"])
         .output()
         .map_err(|e| format!("ffmpeg not available: {e}"))?;
@@ -365,6 +378,10 @@ struct VideoView {
     error: Option<String>,
     /// A preview frame shown large instead of the contact sheet.
     enlarged: Option<usize>,
+    /// Full-resolution copies of the enlarged frame and its neighbours,
+    /// drawn over the preview once they land.
+    full: HashMap<usize, TextureHandle>,
+    full_pending: HashSet<usize>,
 }
 
 impl VideoView {
@@ -385,6 +402,7 @@ impl VideoView {
 enum VideoMsg {
     Info(u64, VideoInfo),
     Frame(u64, usize, ColorImage),
+    Full(u64, usize, ColorImage),
     Error(u64, String),
 }
 
@@ -983,6 +1001,8 @@ impl GeeqApp {
             loading: false,
             error: None,
             enlarged: None,
+            full: HashMap::new(),
+            full_pending: HashSet::new(),
         });
         if self.loads_videos() {
             self.load_video_preview();
@@ -1403,7 +1423,10 @@ impl GeeqApp {
 
         while let Ok(msg) = self.video_rx.try_recv() {
             let gen = match &msg {
-                VideoMsg::Info(g, _) | VideoMsg::Frame(g, _, _) | VideoMsg::Error(g, _) => *g,
+                VideoMsg::Info(g, _)
+                | VideoMsg::Frame(g, _, _)
+                | VideoMsg::Full(g, _, _)
+                | VideoMsg::Error(g, _) => *g,
             };
             if gen != self.generation {
                 continue;
@@ -1417,11 +1440,17 @@ impl GeeqApp {
                         video.received += 1;
                     }
                 }
+                VideoMsg::Full(_, i, frame) => {
+                    video.full_pending.remove(&i);
+                    let texture = ctx.load_texture(format!("vfull:{i}"), frame, TextureOptions::LINEAR);
+                    video.full.insert(i, texture);
+                }
                 VideoMsg::Error(_, err) => video.error = Some(err),
             }
         }
         if let Some(video) = &self.video {
-            if video.loading && video.error.is_none() && video.received < video.expected() {
+            let frames_due = video.loading && video.error.is_none() && video.received < video.expected();
+            if frames_due || !video.full_pending.is_empty() {
                 // Frames that fail to extract never arrive; poll gently.
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
@@ -1896,26 +1925,41 @@ impl GeeqApp {
                 let n = expected.max(1);
                 video.enlarged = Some(if right { (i + 1) % n } else { (i + n - 1) % n });
             }
-            if let Some(texture) = video.enlarged.and_then(|i| video.frames[i].as_ref()) {
-                let size = texture.size_vec2();
-                let scale = (rect.width() / size.x).min((rect.height() - 20.0) / size.y);
-                let img = egui::Rect::from_center_size(rect.center(), size * scale.max(0.01));
-                ui.painter().image(
-                    texture.id(),
-                    img,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            }
             if let Some(i) = video.enlarged {
+                // The full-res frame, once it lands, fills the exact rect the
+                // preview did, so the swap only sharpens the picture.
+                let preview = video.frames[i].as_ref();
+                let full = video.full.get(&i);
+                if let Some(size) = preview.or(full).map(|t| t.size_vec2()) {
+                    let scale = (rect.width() / size.x).min((rect.height() - 20.0) / size.y);
+                    let img = egui::Rect::from_center_size(rect.center(), size * scale.max(0.01));
+                    if let Some(texture) = full.or(preview) {
+                        ui.painter().image(
+                            texture.id(),
+                            img,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+                let res = match full {
+                    Some(t) => format!("   {}x{}", t.size()[0], t.size()[1]),
+                    None if video.full_pending.contains(&i) => "   loading full res".to_string(),
+                    None => String::new(),
+                };
                 ui.painter().text(
                     rect.left_bottom() + egui::vec2(4.0, -4.0),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("frame {}/{expected} @ {:.1} s   ←/→ step, Esc back", i + 1, video.frame_time(i)),
+                    format!(
+                        "frame {}/{expected} @ {:.1} s{res}   ←/→ step, Esc back",
+                        i + 1,
+                        video.frame_time(i)
+                    ),
                     egui::FontId::proportional(13.0),
                     ui.visuals().text_color(),
                 );
             }
+            self.request_full_frames(ctx);
             return;
         }
 
@@ -1979,9 +2023,39 @@ impl GeeqApp {
             let resp = resp.on_hover_text(format!("frame {} @ {:.1} s", i + 1, t));
             if resp.clicked() && video.frames[i].is_some() {
                 video.enlarged = Some(i);
+                self.request_full_frames(ctx);
             }
         }
-        let _ = ctx;
+    }
+
+    /// Pulls the enlarged frame at full resolution in the background, then
+    /// its neighbours so Left/Right land on sharp frames too. Copies more
+    /// than one step away are dropped to bound memory on 4K+ video.
+    fn request_full_frames(&mut self, ctx: &egui::Context) {
+        let Some(video) = &mut self.video else { return };
+        let Some(i) = video.enlarged else { return };
+        let n = video.expected().max(1);
+        let near = |j: usize| {
+            let d = (j + n - i) % n;
+            d <= 1 || d == n - 1
+        };
+        video.full.retain(|&j, _| near(j));
+        let max_side = ctx.input(|inp| inp.max_texture_side);
+        for j in [i, (i + 1) % n, (i + n - 1) % n] {
+            if video.full.contains_key(&j) || !video.full_pending.insert(j) {
+                continue;
+            }
+            let (gen, path, secs) = (self.generation, video.path.clone(), video.frame_time(j));
+            let (tx, current) = (self.video_tx.clone(), Arc::clone(&self.video_gen));
+            thread::spawn(move || {
+                if current.load(Ordering::Relaxed) != gen {
+                    return;
+                }
+                if let Ok(frame) = video_frame_full(&path, secs, max_side) {
+                    let _ = tx.send(VideoMsg::Full(gen, j, frame));
+                }
+            });
+        }
     }
 
     /// Wheel over the viewer steps through the folder: down = next, up =
