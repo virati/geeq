@@ -31,6 +31,8 @@ clicking. `C`, Options or Full in the radial menu switches to the full UI
 
 Video mode: add `--video` (or `-V`) to either command.
 
+To play the shown video, pick Player in the radial menu or the 🎞 smplayer button above the frame sheet (needs `smplayer` on `PATH`).
+
 ## Features
 
 - **Folder navigator + file list** on the left, open at start in `geeq` and `pgeeq`, toggled with Files in the radial menu (`.`/`..` entries, hidden-file toggle, recently-active directories weighted by usage)

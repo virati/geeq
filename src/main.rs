@@ -1773,6 +1773,7 @@ impl GeeqApp {
     /// Left/Right step frames there, Esc or a click goes back to the sheet.
     fn draw_video(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut load = false;
+        let mut play = false;
         let Some(video) = &mut self.video else { return };
         let expected = video.expected();
         ui.horizontal(|ui| {
@@ -1789,7 +1790,14 @@ impl GeeqApp {
             if !video.loading && ui.button("Load preview").clicked() {
                 load = true;
             }
+            if ui.button("🎞 smplayer").on_hover_text("Play this video in smplayer").clicked() {
+                play = true;
+            }
         });
+        if play {
+            self.open_in_player();
+        }
+        let Some(video) = &mut self.video else { return };
         ui.separator();
         if let Some(err) = &video.error {
             ui.colored_label(Color32::LIGHT_RED, err);
@@ -2907,6 +2915,7 @@ enum RadialAction {
     Up,
     Options,
     FullUi,
+    Player,
 }
 
 /// Distance from the menu's center to each slot, and each slot's radius.
@@ -2957,6 +2966,9 @@ impl GeeqApp {
             let on = self.clip_stack.contains(path);
             items.push((RadialAction::Clip, "📋\nClip".to_string(), on, "Add/remove this file in the clip stack (\\)"));
         }
+        if self.video.is_some() {
+            items.push((RadialAction::Player, "🎞\nPlayer".to_string(), false, "Play this video in smplayer"));
+        }
         if let Some(anim) = self.loaded.as_ref().and_then(|l| l.anim.as_ref()) {
             let label = if anim.paused { "▶\nPlay" } else { "⏸\nPause" };
             items.push((RadialAction::Pause, label.to_string(), anim.paused, "Pause / play the animation"));
@@ -2968,6 +2980,18 @@ impl GeeqApp {
             (RadialAction::Options, "⚙\nOptions".to_string(), self.show_options, "Options panel: looks, slideshow, recent folders"),
         ]);
         items
+    }
+
+    /// Plays the shown video in smplayer. Waited on in the background so it
+    /// isn't left as a zombie.
+    fn open_in_player(&mut self) {
+        let Some(path) = self.video.as_ref().map(|v| v.path.clone()) else { return };
+        match std::process::Command::new("smplayer").arg(&path).spawn() {
+            Ok(mut child) => {
+                thread::spawn(move || child.wait());
+            }
+            Err(e) => self.error = Some(format!("smplayer: {e}")),
+        }
     }
 
     /// Runs a radial menu action. Returns true if the menu should stay
@@ -3017,6 +3041,7 @@ impl GeeqApp {
                     self.toggle_clip_stack(ctx, path);
                 }
             }
+            RadialAction::Player => self.open_in_player(),
             RadialAction::Pause => {
                 if let Some(anim) = self.loaded.as_mut().and_then(|l| l.anim.as_mut()) {
                     anim.paused = !anim.paused;
