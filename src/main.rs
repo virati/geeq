@@ -227,7 +227,11 @@ fn has_extension(path: &Path, list: &[&str]) -> bool {
 }
 
 fn is_image_file(path: &Path) -> bool {
-    has_extension(path, IMAGE_EXTENSIONS) || is_raw_file(path)
+    has_extension(path, IMAGE_EXTENSIONS) || is_raw_file(path) || is_pdf_file(path)
+}
+
+fn is_pdf_file(path: &Path) -> bool {
+    has_extension(path, &["pdf"])
 }
 
 fn is_raw_file(path: &Path) -> bool {
@@ -338,7 +342,12 @@ fn make_thumbnail(path: &Path) -> Option<ColorImage> {
         let info = probe_video(path).ok()?;
         return video_frame(path, info.duration * 0.1, THUMB_SIZE).ok();
     }
-    let rgba = decode_to_rgba(path).ok()?;
+    // Render PDFs at thumbnail size instead of the full preview.
+    let rgba = if is_pdf_file(path) {
+        render_pdf_pages(path, THUMB_SIZE).ok()?
+    } else {
+        decode_to_rgba(path).ok()?
+    };
     let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(THUMB_SIZE, THUMB_SIZE).to_rgba8();
     let (w, h) = (thumb.width() as usize, thumb.height() as usize);
     Some(ColorImage::from_rgba_unmultiplied([w, h], thumb.as_raw()))
@@ -611,8 +620,16 @@ struct GeeqApp {
     video_tx: mpsc::Sender<VideoMsg>,
     video_rx: mpsc::Receiver<VideoMsg>,
     /// Generation the preview workers check so a superseded video stops
-    /// spawning ffmpeg processes.
+    /// spawning ffmpeg processes (and preloading stops for a file left).
     video_gen: Arc<AtomicU64>,
+    /// Decoded originals of the shown file and its neighbours, filled in
+    /// the background after each load so stepping to the next file skips
+    /// the decode.
+    preloaded: Arc<Mutex<HashMap<PathBuf, Arc<image::RgbaImage>>>>,
+    /// Page height the shown PDF is rendered at, and a sharper height
+    /// wanted since when (rendered once the zoom holds still).
+    pdf_height: u32,
+    pdf_want: Option<(u32, f64)>,
 }
 
 impl GeeqApp {
@@ -726,6 +743,9 @@ impl GeeqApp {
             video_tx,
             video_rx,
             video_gen: Arc::new(AtomicU64::new(0)),
+            preloaded: Arc::new(Mutex::new(HashMap::new())),
+            pdf_height: PDF_PREVIEW_HEIGHT,
+            pdf_want: None,
         };
         if let Some(path) = looks_path_file()
             .and_then(|f| fs::read_to_string(f).ok())
@@ -891,7 +911,9 @@ impl GeeqApp {
         self.exposure_points.clear();
         self.sharpness_points.clear();
         let gen = self.dir_generation;
-        let images: Vec<PathBuf> = self.files.iter().filter(|p| is_image_file(p)).cloned().collect();
+        // Documents have no exposure and their sharpness means nothing.
+        let images: Vec<PathBuf> =
+            self.files.iter().filter(|p| is_image_file(p) && !is_pdf_file(p)).cloned().collect();
 
         let exposure_files = images.clone();
         let exposure_tx = self.exposure_tx.clone();
@@ -1168,6 +1190,8 @@ impl GeeqApp {
         self.image_scroll_reset = true;
         self.rotation = 0;
         self.video = None;
+        self.pdf_height = PDF_PREVIEW_HEIGHT;
+        self.pdf_want = None;
         self.generation += 1;
         self.video_gen.store(self.generation, Ordering::Relaxed);
         let gen = self.generation;
@@ -1183,6 +1207,23 @@ impl GeeqApp {
         });
         self.filtering = false;
 
+        // Still images either side, decoded after this one; the cache keeps
+        // only this file and those.
+        let neighbours: Vec<PathBuf> = self
+            .selected_index
+            .into_iter()
+            .flat_map(|i| [i + 1, i.wrapping_sub(1)])
+            .filter_map(|i| self.files.get(i))
+            .filter(|p| is_image_file(p) && !has_extension(p, &["gif", "webp"]))
+            .cloned()
+            .collect();
+        let preloaded = Arc::clone(&self.preloaded);
+        preloaded
+            .lock()
+            .unwrap()
+            .retain(|p, _| *p == path || neighbours.contains(p));
+        let current = Arc::clone(&self.video_gen);
+
         let decode_tx = self.load_tx.clone();
         let decode_path = path.clone();
         let rev = self.filter_rev;
@@ -1194,10 +1235,15 @@ impl GeeqApp {
             // ordinary still-image path.
             let mut anim = anim_frames(&decode_path);
             let first = anim.as_mut().and_then(|it| it.next()).and_then(|f| f.ok()).map(frame_with_delay);
-            let decoded = match &first {
-                Some((img, _)) => Ok(Arc::new(img.clone())),
-                None => decode_to_rgba(&decode_path).map(Arc::new),
+            let cached = preloaded.lock().unwrap().get(&decode_path).cloned();
+            let decoded = match (&first, cached) {
+                (Some((img, _)), _) => Ok(Arc::new(img.clone())),
+                (None, Some(rgba)) => Ok(rgba),
+                (None, None) => decode_to_rgba(&decode_path).map(Arc::new),
             };
+            if let (None, Ok(rgba)) = (&first, &decoded) {
+                preloaded.lock().unwrap().insert(decode_path.clone(), Arc::clone(rgba));
+            }
             match decoded {
                 Ok(rgba) => {
                     let _ = decode_tx.send(LoadMsg::Original(gen, rev, decode_path.clone(), rgba.clone()));
@@ -1220,6 +1266,19 @@ impl GeeqApp {
                         "Failed to open {}: {err}",
                         decode_path.file_name().unwrap_or_default().to_string_lossy()
                     )));
+                }
+            }
+            for p in neighbours {
+                // Moved on (e.g. holding an arrow key): leave it to the
+                // newer load.
+                if current.load(Ordering::Relaxed) != gen {
+                    return;
+                }
+                if preloaded.lock().unwrap().contains_key(&p) {
+                    continue;
+                }
+                if let Ok(rgba) = decode_to_rgba(&p) {
+                    preloaded.lock().unwrap().insert(p, Arc::new(rgba));
                 }
             }
         });
@@ -1795,7 +1854,7 @@ impl GeeqApp {
             }
         });
         if play {
-            self.open_in_player();
+            self.open_with("smplayer", self.video.as_ref().map(|v| v.path.clone()));
         }
         let Some(video) = &mut self.video else { return };
         ui.separator();
@@ -2060,9 +2119,82 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
             .map_err(|e| e.to_string());
     }
 
+    if is_pdf_file(path) {
+        return render_pdf_pages(path, PDF_PREVIEW_HEIGHT);
+    }
+
     image::open(path)
         .map(|img| img.to_rgba8())
         .map_err(|e| e.to_string())
+}
+
+/// A PDF's document info from poppler's `pdfinfo`, laid out like EXIF: the
+/// title as the headline, the main fields up front, the rest folded away.
+fn pdf_info(path: &Path) -> Option<ExifInfo> {
+    let out = std::process::Command::new("pdfinfo").arg(path).output().ok()?;
+    let mut fields: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    let mut take = |k: &str| fields.iter().position(|f| f.0 == k).map(|i| fields.remove(i).1);
+    let camera = Some(take("Title").unwrap_or_else(|| "Untitled PDF".to_string()));
+    let mut key = Vec::new();
+    for (k, label) in [
+        ("Pages", "Pages"),
+        ("Author", "Author"),
+        ("Page size", "Page size"),
+        ("CreationDate", "Created"),
+        ("ModDate", "Modified"),
+        ("PDF version", "PDF version"),
+    ] {
+        if let Some(v) = take(k) {
+            key.push((label.to_string(), v));
+        }
+    }
+    Some(ExifInfo { camera, key, other: fields, radial: RadialStats::default() })
+}
+
+/// Page height of the PDF preview: screen-sized, not print-sized, so it
+/// renders fast and still has headroom to zoom.
+const PDF_PREVIEW_HEIGHT: u32 = 1400;
+/// Tallest sharp re-render when zoomed in (two pages at this height are
+/// already a few hundred MB of pixels).
+const PDF_MAX_HEIGHT: u32 = 5600;
+
+/// Pages 1 and 2 of a PDF side by side, each `height` px tall (just page 1
+/// for a one-page PDF). Each page is a poppler `pdftoppm` run, both at once,
+/// writing PPM straight to memory.
+fn render_pdf_pages(path: &Path, height: u32) -> Result<image::RgbaImage, String> {
+    let render = |page: &str| {
+        let out = std::process::Command::new("pdftoppm")
+            .args(["-f", page, "-l", page, "-singlefile", "-scale-to-x", "-1"])
+            .args(["-scale-to-y", &height.to_string()])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("pdftoppm: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        image::load_from_memory_with_format(&out.stdout, image::ImageFormat::Pnm)
+            .map(|img| img.to_rgba8())
+            .map_err(|e| e.to_string())
+    };
+    let (first, second) = thread::scope(|s| {
+        let second = s.spawn(|| render("2"));
+        (render("1"), second.join().unwrap())
+    });
+    let first = first?;
+    let Ok(second) = second else { return Ok(first) };
+    let gap = (height / 40).max(2);
+    let mut both = image::RgbaImage::new(
+        first.width() + gap + second.width(),
+        first.height().max(second.height()),
+    );
+    image::imageops::replace(&mut both, &first, 0, 0);
+    image::imageops::replace(&mut both, &second, (first.width() + gap) as i64, 0);
+    Ok(both)
 }
 
 /// The frames of an animated GIF or WebP, composited to the full canvas.
@@ -2256,6 +2388,9 @@ fn exif_info_from_raw(path: &Path) -> Option<ExifInfo> {
 
 fn read_exif(path: &Path) -> ExifInfo {
     let empty = || ExifInfo { camera: None, key: Vec::new(), other: Vec::new(), radial: RadialStats::default() };
+    if is_pdf_file(path) {
+        return pdf_info(path).unwrap_or_else(empty);
+    }
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return empty(),
@@ -2796,7 +2931,8 @@ impl eframe::App for GeeqApp {
                 }
 
                 ui.separator();
-                ui.heading("EXIF");
+                let pdf = is_pdf_file(&loaded.path);
+                ui.heading(if pdf { "Document" } else { "EXIF" });
                 match &loaded.exif {
                     Some(exif) => {
                         egui::ScrollArea::vertical()
@@ -2830,7 +2966,8 @@ impl eframe::App for GeeqApp {
                                 if !exif.other.is_empty() {
                                     ui.add_space(4.0);
                                     egui::CollapsingHeader::new(format!(
-                                        "Other EXIF ({})",
+                                        "Other {} ({})",
+                                        if pdf { "fields" } else { "EXIF" },
                                         exif.other.len()
                                     ))
                                     .default_open(false)
@@ -2916,6 +3053,7 @@ enum RadialAction {
     Options,
     FullUi,
     Player,
+    Reader,
 }
 
 /// Distance from the menu's center to each slot, and each slot's radius.
@@ -2969,6 +3107,9 @@ impl GeeqApp {
         if self.video.is_some() {
             items.push((RadialAction::Player, "🎞\nPlayer".to_string(), false, "Play this video in smplayer"));
         }
+        if self.selected_file.as_deref().is_some_and(is_pdf_file) {
+            items.push((RadialAction::Reader, "📄\nReader".to_string(), false, "Open this PDF in your PDF reader"));
+        }
         if let Some(anim) = self.loaded.as_ref().and_then(|l| l.anim.as_ref()) {
             let label = if anim.paused { "▶\nPlay" } else { "⏸\nPause" };
             items.push((RadialAction::Pause, label.to_string(), anim.paused, "Pause / play the animation"));
@@ -2982,15 +3123,17 @@ impl GeeqApp {
         items
     }
 
-    /// Plays the shown video in smplayer. Waited on in the background so it
-    /// isn't left as a zombie.
-    fn open_in_player(&mut self) {
-        let Some(path) = self.video.as_ref().map(|v| v.path.clone()) else { return };
-        match std::process::Command::new("smplayer").arg(&path).spawn() {
+    /// Opens a file in another app: smplayer for the shown video, or the
+    /// desktop's default app (`xdg-open`, e.g. the PDF reader) for the
+    /// selected file. Waited on in the background so it isn't left as a
+    /// zombie.
+    fn open_with(&mut self, program: &str, path: Option<PathBuf>) {
+        let Some(path) = path else { return };
+        match std::process::Command::new(program).arg(&path).spawn() {
             Ok(mut child) => {
                 thread::spawn(move || child.wait());
             }
-            Err(e) => self.error = Some(format!("smplayer: {e}")),
+            Err(e) => self.error = Some(format!("{program}: {e}")),
         }
     }
 
@@ -3041,7 +3184,8 @@ impl GeeqApp {
                     self.toggle_clip_stack(ctx, path);
                 }
             }
-            RadialAction::Player => self.open_in_player(),
+            RadialAction::Player => self.open_with("smplayer", self.video.as_ref().map(|v| v.path.clone())),
+            RadialAction::Reader => self.open_with("xdg-open", self.selected_file.clone()),
             RadialAction::Pause => {
                 if let Some(anim) = self.loaded.as_mut().and_then(|l| l.anim.as_mut()) {
                     anim.paused = !anim.paused;
@@ -3251,17 +3395,24 @@ impl GeeqApp {
 
             if !self.compact {
                 let mut toggle_info_panel = false;
+                let mut open_reader = false;
                 {
                     let loaded = self.loaded.as_ref().unwrap();
                     ui.horizontal(|ui| {
                         let name = loaded.path.file_name().unwrap_or_default().to_string_lossy();
                         if loaded.texture.is_some() {
-                            ui.label(format!(
-                                "{name}  ({}x{})  zoom {:.0}%",
-                                loaded.size.x as i32,
-                                loaded.size.y as i32,
-                                self.zoom * 100.0
-                            ));
+                            // A PDF's render size changes on zoom; show its
+                            // page count instead.
+                            let size = loaded
+                                .exif
+                                .as_ref()
+                                .filter(|_| is_pdf_file(&loaded.path))
+                                .and_then(|e| e.key.iter().find(|(k, _)| k == "Pages"))
+                                .map_or_else(
+                                    || format!("{}x{}", loaded.size.x as i32, loaded.size.y as i32),
+                                    |(_, n)| format!("{n} pages"),
+                                );
+                            ui.label(format!("{name}  ({size})  zoom {:.0}%", self.zoom * 100.0));
                         } else {
                             ui.label(format!("{name}  (decoding...)"));
                         }
@@ -3274,11 +3425,19 @@ impl GeeqApp {
                             {
                                 toggle_info_panel = true;
                             }
+                            if is_pdf_file(&loaded.path)
+                                && ui.button("📄 Reader").on_hover_text("Open this PDF in your PDF reader").clicked()
+                            {
+                                open_reader = true;
+                            }
                         });
                     });
                 }
                 if toggle_info_panel {
                     self.show_info_panel = !self.show_info_panel;
+                }
+                if open_reader {
+                    self.open_with("xdg-open", self.selected_file.clone());
                 }
                 ui.separator();
 
@@ -3466,10 +3625,56 @@ impl GeeqApp {
                     });
                 }
             }
+            self.sharpen_pdf(ctx, avail);
             if self.compact {
                 self.draw_caption(ui, image_rect);
             }
         }
+    }
+
+    /// Re-renders a zoomed-in PDF at the size it's shown once the zoom holds
+    /// still for a moment, so small text is sharp instead of a magnified
+    /// preview. Capped by the GPU's texture limit and PDF_MAX_HEIGHT.
+    fn sharpen_pdf(&mut self, ctx: &egui::Context, avail: egui::Vec2) {
+        let Some(loaded) = self.loaded.as_ref() else { return };
+        if loaded.texture.is_none() || !is_pdf_file(&loaded.path) {
+            return;
+        }
+        let (size, path) = (loaded.size, loaded.path.clone());
+        let (w, h) = if self.rotation % 2 == 1 { (size.y, size.x) } else { (size.x, size.y) };
+        // Screen pixels per texture pixel.
+        let magnified = (avail.x / w).min(avail.y / h) * self.zoom * ctx.pixels_per_point();
+        let fits = ctx.input(|i| i.max_texture_side) as f32 / size.x.max(size.y);
+        let want = ((size.y * magnified.min(fits)) as u32).min(PDF_MAX_HEIGHT) / 100 * 100;
+        if (want as f32) < self.pdf_height as f32 * 1.25 {
+            self.pdf_want = None;
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        match self.pdf_want {
+            Some((h, since)) if h == want && now - since >= 0.25 => {}
+            Some((h, _)) if h == want => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            _ => {
+                self.pdf_want = Some((want, now));
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                return;
+            }
+        }
+        self.pdf_want = None;
+        self.pdf_height = want;
+        let (tx, gen, rev) = (self.load_tx.clone(), self.generation, self.filter_rev);
+        let active = self.active_look_list();
+        thread::spawn(move || {
+            let Ok(rgba) = render_pdf_pages(&path, want) else { return };
+            let rgba = Arc::new(rgba);
+            let _ = tx.send(LoadMsg::Original(gen, rev, path.clone(), rgba.clone()));
+            let (color_image, histogram) = render_filtered(&rgba, &active);
+            let _ = tx.send(LoadMsg::Texture(gen, rev, path.clone(), color_image));
+            let _ = tx.send(LoadMsg::Histogram(gen, rev, path, histogram));
+        });
     }
 
     /// A faint one-line caption along the bottom of the photo: name,
@@ -3481,8 +3686,20 @@ impl GeeqApp {
         if let Some(i) = self.selected_index {
             text += &format!("   {}/{}", i + 1, self.files.len());
         }
+        // A PDF's render size means nothing (it changes on zoom); its page
+        // count does.
+        let pages = loaded
+            .exif
+            .as_ref()
+            .filter(|_| is_pdf_file(&loaded.path))
+            .and_then(|e| e.key.iter().find(|(k, _)| k == "Pages"));
+        if let Some((_, n)) = pages {
+            text += &format!("   {n} pages");
+        }
         if loaded.texture.is_some() {
-            text += &format!("   {}x{}", loaded.size.x as i32, loaded.size.y as i32);
+            if pages.is_none() {
+                text += &format!("   {}x{}", loaded.size.x as i32, loaded.size.y as i32);
+            }
             if self.zoom > ZOOM_MIN {
                 text += &format!("   {:.0}%", self.zoom * 100.0);
             }
@@ -3817,6 +4034,44 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod gif_tests {
     use super::*;
+
+    /// A minimal PDF of `pages` blank 200x100 pt pages (poppler rebuilds
+    /// the missing xref table).
+    fn write_pdf(path: &Path, pages: usize) {
+        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", i + 3)).collect();
+        let mut pdf = format!(
+            "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+             2 0 obj << /Type /Pages /Kids [{}] /Count {pages} >> endobj\n",
+            kids.join(" ")
+        );
+        for i in 0..pages {
+            pdf += &format!(
+                "{} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >> endobj\n",
+                i + 3
+            );
+        }
+        pdf += "trailer << /Root 1 0 R >>\n%%EOF\n";
+        fs::write(path, pdf).unwrap();
+    }
+
+    #[test]
+    fn pdf_preview_shows_first_two_pages_side_by_side() {
+        let dir = std::env::temp_dir();
+        let three = dir.join("geeq-test-3pages.pdf");
+        write_pdf(&three, 3);
+        let img = render_pdf_pages(&three, 50).unwrap();
+        // Two 100x50 pages and a 2 px gap; page 3 is left out.
+        assert_eq!((img.width(), img.height()), (202, 50));
+
+        let one = dir.join("geeq-test-1page.pdf");
+        write_pdf(&one, 1);
+        let img = render_pdf_pages(&one, 50).unwrap();
+        assert_eq!((img.width(), img.height()), (100, 50));
+
+        let info = pdf_info(&three).unwrap();
+        assert_eq!(info.camera.as_deref(), Some("Untitled PDF"));
+        assert!(info.key.contains(&("Pages".to_string(), "3".to_string())));
+    }
 
     /// Set GEEQ_TEST_RAW to a camera raw/DNG path to exercise the raw decoder.
     #[test]

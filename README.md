@@ -49,6 +49,7 @@ To play the shown video, pick Player in the radial menu or the 🎞 smplayer but
 - **Slideshow / screensaver**: `S` (or Options → Slideshow) goes fullscreen and cycles the folder every 3–30 s (default 7, optional shuffle) with the currently selected live filters applied. `Esc`, `S` or a click exits; arrow keys still step manually
 - **Animated GIFs and WebPs** play in the viewer, showing the first frame while the rest decode (Pause in the radial menu, frame counter in the caption); live filters apply to every frame
 - **Camera raw / DNG**: `.dng`, `.raw`, `.rw2`, `.cr2`/`.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.pef` and more open like any other photo (via [rawler](https://crates.io/crates/rawler)). Uses the embedded full-size preview when the file has one, otherwise develops the raw data. Display only; the files are never touched
+- **PDF preview**: `.pdf` files list like photos and open as pages 1 and 2 side by side (one page for a one-page PDF), rendered at screen size by poppler's `pdftoppm`, both pages at once. Grid thumbnails render at thumbnail size. Zooming in re-renders the pages sharp at the shown size once the zoom holds still. The Info panel shows the document info (title, pages, author, page size, dates) and the caption the page count. Reader (radial menu, or the full UI header) opens the PDF in your default PDF app
 - JPEG decoding via libjpeg-turbo (`turbojpeg`); everything else via the `image` crate
 
 ## Running
@@ -59,4 +60,4 @@ cargo run --release
 
 ## Building
 
-Requires a system install of `libjpeg-turbo` (for the `turbojpeg` crate).
+Requires a system install of `libjpeg-turbo` (for the `turbojpeg` crate). PDF preview needs poppler's `pdftoppm` on `PATH`.
