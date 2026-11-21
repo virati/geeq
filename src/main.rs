@@ -2094,23 +2094,6 @@ impl GeeqApp {
 /// the pure-Rust decoder in the `image` crate; everything else falls back to
 /// `image::open`.
 fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
-    let is_jpeg = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_ascii_lowercase();
-            e == "jpg" || e == "jpeg"
-        })
-        .unwrap_or(false);
-
-    if is_jpeg {
-        let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        match turbojpeg::decompress_image::<image::Rgba<u8>>(&bytes) {
-            Ok(rgba) => return Ok(rgba),
-            Err(_) => { /* fall through to the generic decoder below */ }
-        }
-    }
-
     if is_raw_file(path) {
         // The embedded full-size preview when the file has one (fast, and
         // the camera's own rendering), otherwise a developed raw.
@@ -2123,9 +2106,18 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
         return render_pdf_pages(path, PDF_PREVIEW_HEIGHT);
     }
 
-    image::open(path)
-        .map(|img| img.to_rgba8())
-        .map_err(|e| e.to_string())
+    // The format comes from the file's first bytes, not its name, so a
+    // JPEG saved as .webp (Snapseed does this) still opens.
+    let reader = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())?;
+    if reader.format() == Some(image::ImageFormat::Jpeg) {
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        if let Ok(rgba) = turbojpeg::decompress_image::<image::Rgba<u8>>(&bytes) {
+            return Ok(rgba);
+        }
+    }
+    reader.decode().map(|img| img.to_rgba8()).map_err(|e| e.to_string())
 }
 
 /// A PDF's document info from poppler's `pdfinfo`, laid out like EXIF: the
@@ -2198,14 +2190,16 @@ fn render_pdf_pages(path: &Path, height: u32) -> Result<image::RgbaImage, String
 }
 
 /// The frames of an animated GIF or WebP, composited to the full canvas.
-/// None for other formats and for still WebPs.
+/// None for other formats and for still WebPs. Goes by the file's
+/// contents, like `decode_to_rgba`, not its extension.
 fn anim_frames(path: &Path) -> Option<image::Frames<'static>> {
-    use image::AnimationDecoder;
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    let file = std::io::BufReader::new(fs::File::open(path).ok()?);
-    match ext.as_str() {
-        "gif" => Some(image::codecs::gif::GifDecoder::new(file).ok()?.into_frames()),
-        "webp" => {
+    use image::{AnimationDecoder, ImageFormat};
+    let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let format = reader.format()?;
+    let file = reader.into_inner();
+    match format {
+        ImageFormat::Gif => Some(image::codecs::gif::GifDecoder::new(file).ok()?.into_frames()),
+        ImageFormat::WebP => {
             let decoder = image::codecs::webp::WebPDecoder::new(file).ok()?;
             decoder.has_animation().then(|| decoder.into_frames())
         }
@@ -4084,6 +4078,18 @@ mod gif_tests {
         assert!(img.width() > 0 && img.height() > 0);
         let exif = read_exif(path);
         eprintln!("exif camera: {:?}, key fields: {}", exif.camera, exif.key.len());
+    }
+
+    #[test]
+    fn decodes_by_contents_not_extension() {
+        // Snapseed saves JPEGs with a .webp name.
+        let path = std::env::temp_dir().join("geeq-test-jpeg-named.webp");
+        image::RgbImage::from_pixel(8, 6, image::Rgb([200, 10, 10]))
+            .save_with_format(&path, image::ImageFormat::Jpeg)
+            .unwrap();
+        let img = decode_to_rgba(&path).unwrap();
+        assert_eq!((img.width(), img.height()), (8, 6));
+        assert!(anim_frames(&path).is_none());
     }
 
     #[test]
