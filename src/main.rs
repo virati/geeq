@@ -626,6 +626,10 @@ struct GeeqApp {
     /// the background after each load so stepping to the next file skips
     /// the decode.
     preloaded: Arc<Mutex<HashMap<PathBuf, Arc<image::RgbaImage>>>>,
+    /// Page height the shown PDF is rendered at, and a sharper height
+    /// wanted since when (rendered once the zoom holds still).
+    pdf_height: u32,
+    pdf_want: Option<(u32, f64)>,
 }
 
 impl GeeqApp {
@@ -740,6 +744,8 @@ impl GeeqApp {
             video_rx,
             video_gen: Arc::new(AtomicU64::new(0)),
             preloaded: Arc::new(Mutex::new(HashMap::new())),
+            pdf_height: PDF_PREVIEW_HEIGHT,
+            pdf_want: None,
         };
         if let Some(path) = looks_path_file()
             .and_then(|f| fs::read_to_string(f).ok())
@@ -1184,6 +1190,8 @@ impl GeeqApp {
         self.image_scroll_reset = true;
         self.rotation = 0;
         self.video = None;
+        self.pdf_height = PDF_PREVIEW_HEIGHT;
+        self.pdf_want = None;
         self.generation += 1;
         self.video_gen.store(self.generation, Ordering::Relaxed);
         let gen = self.generation;
@@ -2115,6 +2123,9 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
 /// Page height of the PDF preview: screen-sized, not print-sized, so it
 /// renders fast and still has headroom to zoom.
 const PDF_PREVIEW_HEIGHT: u32 = 1400;
+/// Tallest sharp re-render when zoomed in (two pages at this height are
+/// already a few hundred MB of pixels).
+const PDF_MAX_HEIGHT: u32 = 5600;
 
 /// Pages 1 and 2 of a PDF side by side, each `height` px tall (just page 1
 /// for a one-page PDF). Each page is a poppler `pdftoppm` run, both at once,
@@ -3534,10 +3545,56 @@ impl GeeqApp {
                     });
                 }
             }
+            self.sharpen_pdf(ctx, avail);
             if self.compact {
                 self.draw_caption(ui, image_rect);
             }
         }
+    }
+
+    /// Re-renders a zoomed-in PDF at the size it's shown once the zoom holds
+    /// still for a moment, so small text is sharp instead of a magnified
+    /// preview. Capped by the GPU's texture limit and PDF_MAX_HEIGHT.
+    fn sharpen_pdf(&mut self, ctx: &egui::Context, avail: egui::Vec2) {
+        let Some(loaded) = self.loaded.as_ref() else { return };
+        if loaded.texture.is_none() || !is_pdf_file(&loaded.path) {
+            return;
+        }
+        let (size, path) = (loaded.size, loaded.path.clone());
+        let (w, h) = if self.rotation % 2 == 1 { (size.y, size.x) } else { (size.x, size.y) };
+        // Screen pixels per texture pixel.
+        let magnified = (avail.x / w).min(avail.y / h) * self.zoom * ctx.pixels_per_point();
+        let fits = ctx.input(|i| i.max_texture_side) as f32 / size.x.max(size.y);
+        let want = ((size.y * magnified.min(fits)) as u32).min(PDF_MAX_HEIGHT) / 100 * 100;
+        if (want as f32) < self.pdf_height as f32 * 1.25 {
+            self.pdf_want = None;
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        match self.pdf_want {
+            Some((h, since)) if h == want && now - since >= 0.25 => {}
+            Some((h, _)) if h == want => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            _ => {
+                self.pdf_want = Some((want, now));
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                return;
+            }
+        }
+        self.pdf_want = None;
+        self.pdf_height = want;
+        let (tx, gen, rev) = (self.load_tx.clone(), self.generation, self.filter_rev);
+        let active = self.active_look_list();
+        thread::spawn(move || {
+            let Ok(rgba) = render_pdf_pages(&path, want) else { return };
+            let rgba = Arc::new(rgba);
+            let _ = tx.send(LoadMsg::Original(gen, rev, path.clone(), rgba.clone()));
+            let (color_image, histogram) = render_filtered(&rgba, &active);
+            let _ = tx.send(LoadMsg::Texture(gen, rev, path.clone(), color_image));
+            let _ = tx.send(LoadMsg::Histogram(gen, rev, path, histogram));
+        });
     }
 
     /// A faint one-line caption along the bottom of the photo: name,
