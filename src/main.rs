@@ -2120,6 +2120,34 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A PDF's document info from poppler's `pdfinfo`, laid out like EXIF: the
+/// title as the headline, the main fields up front, the rest folded away.
+fn pdf_info(path: &Path) -> Option<ExifInfo> {
+    let out = std::process::Command::new("pdfinfo").arg(path).output().ok()?;
+    let mut fields: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    let mut take = |k: &str| fields.iter().position(|f| f.0 == k).map(|i| fields.remove(i).1);
+    let camera = Some(take("Title").unwrap_or_else(|| "Untitled PDF".to_string()));
+    let mut key = Vec::new();
+    for (k, label) in [
+        ("Pages", "Pages"),
+        ("Author", "Author"),
+        ("Page size", "Page size"),
+        ("CreationDate", "Created"),
+        ("ModDate", "Modified"),
+        ("PDF version", "PDF version"),
+    ] {
+        if let Some(v) = take(k) {
+            key.push((label.to_string(), v));
+        }
+    }
+    Some(ExifInfo { camera, key, other: fields, radial: RadialStats::default() })
+}
+
 /// Page height of the PDF preview: screen-sized, not print-sized, so it
 /// renders fast and still has headroom to zoom.
 const PDF_PREVIEW_HEIGHT: u32 = 1400;
@@ -2352,6 +2380,9 @@ fn exif_info_from_raw(path: &Path) -> Option<ExifInfo> {
 
 fn read_exif(path: &Path) -> ExifInfo {
     let empty = || ExifInfo { camera: None, key: Vec::new(), other: Vec::new(), radial: RadialStats::default() };
+    if is_pdf_file(path) {
+        return pdf_info(path).unwrap_or_else(empty);
+    }
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return empty(),
@@ -2892,7 +2923,8 @@ impl eframe::App for GeeqApp {
                 }
 
                 ui.separator();
-                ui.heading("EXIF");
+                let pdf = is_pdf_file(&loaded.path);
+                ui.heading(if pdf { "Document" } else { "EXIF" });
                 match &loaded.exif {
                     Some(exif) => {
                         egui::ScrollArea::vertical()
@@ -2926,7 +2958,8 @@ impl eframe::App for GeeqApp {
                                 if !exif.other.is_empty() {
                                     ui.add_space(4.0);
                                     egui::CollapsingHeader::new(format!(
-                                        "Other EXIF ({})",
+                                        "Other {} ({})",
+                                        if pdf { "fields" } else { "EXIF" },
                                         exif.other.len()
                                     ))
                                     .default_open(false)
@@ -3335,12 +3368,18 @@ impl GeeqApp {
                     ui.horizontal(|ui| {
                         let name = loaded.path.file_name().unwrap_or_default().to_string_lossy();
                         if loaded.texture.is_some() {
-                            ui.label(format!(
-                                "{name}  ({}x{})  zoom {:.0}%",
-                                loaded.size.x as i32,
-                                loaded.size.y as i32,
-                                self.zoom * 100.0
-                            ));
+                            // A PDF's render size changes on zoom; show its
+                            // page count instead.
+                            let size = loaded
+                                .exif
+                                .as_ref()
+                                .filter(|_| is_pdf_file(&loaded.path))
+                                .and_then(|e| e.key.iter().find(|(k, _)| k == "Pages"))
+                                .map_or_else(
+                                    || format!("{}x{}", loaded.size.x as i32, loaded.size.y as i32),
+                                    |(_, n)| format!("{n} pages"),
+                                );
+                            ui.label(format!("{name}  ({size})  zoom {:.0}%", self.zoom * 100.0));
                         } else {
                             ui.label(format!("{name}  (decoding...)"));
                         }
@@ -3606,8 +3645,20 @@ impl GeeqApp {
         if let Some(i) = self.selected_index {
             text += &format!("   {}/{}", i + 1, self.files.len());
         }
+        // A PDF's render size means nothing (it changes on zoom); its page
+        // count does.
+        let pages = loaded
+            .exif
+            .as_ref()
+            .filter(|_| is_pdf_file(&loaded.path))
+            .and_then(|e| e.key.iter().find(|(k, _)| k == "Pages"));
+        if let Some((_, n)) = pages {
+            text += &format!("   {n} pages");
+        }
         if loaded.texture.is_some() {
-            text += &format!("   {}x{}", loaded.size.x as i32, loaded.size.y as i32);
+            if pages.is_none() {
+                text += &format!("   {}x{}", loaded.size.x as i32, loaded.size.y as i32);
+            }
             if self.zoom > ZOOM_MIN {
                 text += &format!("   {:.0}%", self.zoom * 100.0);
             }
@@ -3975,6 +4026,10 @@ mod gif_tests {
         write_pdf(&one, 1);
         let img = render_pdf_pages(&one, 50).unwrap();
         assert_eq!((img.width(), img.height()), (100, 50));
+
+        let info = pdf_info(&three).unwrap();
+        assert_eq!(info.camera.as_deref(), Some("Untitled PDF"));
+        assert!(info.key.contains(&("Pages".to_string(), "3".to_string())));
     }
 
     /// Set GEEQ_TEST_RAW to a camera raw/DNG path to exercise the raw decoder.
