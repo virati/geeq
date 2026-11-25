@@ -73,6 +73,8 @@ mod ffi {
     pub const EVENT_NONE: c_int = 0;
     pub const EVENT_END_FILE: c_int = 7;
     pub const EVENT_PLAYBACK_RESTART: c_int = 21;
+    pub const EVENT_PROPERTY_CHANGE: c_int = 22;
+    pub const FORMAT_FLAG: c_int = 3;
     pub const END_FILE_REASON_ERROR: c_int = 4;
     pub const RENDER_PARAM_INVALID: c_int = 0;
     pub const RENDER_PARAM_API_TYPE: c_int = 1;
@@ -90,6 +92,7 @@ mod ffi {
         pub fn mpv_command_async(h: *mut Handle, reply: u64, args: *mut *const c_char) -> c_int;
         pub fn mpv_wait_event(h: *mut Handle, timeout: f64) -> *mut Event;
         pub fn mpv_terminate_destroy(h: *mut Handle);
+        pub fn mpv_observe_property(h: *mut Handle, reply: u64, name: *const c_char, format: c_int) -> c_int;
         pub fn mpv_set_wakeup_callback(h: *mut Handle, cb: Option<unsafe extern "C" fn(*mut c_void)>, d: *mut c_void);
         pub fn mpv_error_string(e: c_int) -> *const c_char;
         pub fn mpv_render_context_create(res: *mut *mut RenderCtx, mpv: *mut Handle, params: *mut RenderParam) -> c_int;
@@ -149,6 +152,10 @@ struct GlTile {
     /// First frame decoded (or the tile failed).
     ready: bool,
     failed: bool,
+    /// Slideshow: being watched for the end of its last play.
+    armed: bool,
+    /// Slideshow: played all its plays (or cannot play).
+    done: bool,
 }
 
 // Raw pointers are only used from the UI thread.
@@ -168,6 +175,8 @@ impl GlTile {
             needs_render: true,
             ready: false,
             failed: false,
+            armed: false,
+            done: false,
         };
 
         unsafe {
@@ -214,6 +223,8 @@ impl GlTile {
                 t.fail(&format!("mpv_initialize: {}", CStr::from_ptr(ffi::mpv_error_string(err)).to_string_lossy()));
                 return t;
             }
+            // eof-reached turns true after the last of the finite loops (keep-open holds the last frame).
+            ffi::mpv_observe_property(m, 0, c"eof-reached".as_ptr(), ffi::FORMAT_FLAG);
             ffi::mpv_set_wakeup_callback(m, Some(wake), t.wake_ctx as *mut c_void);
             t.mpv = m;
         }
@@ -224,6 +235,7 @@ impl GlTile {
         eprintln!("kgallery: {}: {why}", self.path.display());
         self.failed = true;
         self.ready = true;
+        self.done = true; // a broken file must not hold the slideshow back
     }
 
     fn set_property(&self, name: &str, value: &str) {
@@ -236,6 +248,14 @@ impl GlTile {
 
     fn set_paused(&self, paused: bool) {
         self.set_property("pause", if paused { "yes" } else { "no" });
+    }
+
+    /// Play the file `plays` times in all, or forever when 0 (loop-file=N repeats N times).
+    fn set_plays(&mut self, plays: u32) {
+        self.armed = plays > 0;
+        self.done = self.failed;
+        let value = if plays > 0 { (plays - 1).to_string() } else { "inf".to_string() };
+        self.set_property("loop-file", &value);
     }
 
     fn rewind(&self) {
@@ -258,6 +278,15 @@ impl GlTile {
             match ev.event_id {
                 ffi::EVENT_NONE => break,
                 ffi::EVENT_PLAYBACK_RESTART => self.ready = true,
+                ffi::EVENT_PROPERTY_CHANGE if !ev.data.is_null() => {
+                    let prop = unsafe { &*(ev.data as *const ffi::EventProperty) };
+                    let is_eof = !prop.name.is_null() && unsafe { CStr::from_ptr(prop.name) }.to_bytes() == b"eof-reached";
+                    if is_eof && prop.format == ffi::FORMAT_FLAG && !prop.data.is_null() {
+                        if unsafe { *(prop.data as *const c_int) } != 0 && self.armed {
+                            self.done = true;
+                        }
+                    }
+                }
                 ffi::EVENT_END_FILE if !ev.data.is_null() => {
                     let end = unsafe { &*(ev.data as *const ffi::EventEndFile) };
                     if end.reason == ffi::END_FILE_REASON_ERROR {
@@ -428,6 +457,12 @@ pub struct KGallery {
     pages: Vec<Page>,
     paused: bool,
     fullscreen: bool,
+    /// Slideshow: each page plays every video `loops` times, waits `interval`
+    /// seconds after the last play, then moves to the next page.
+    show: bool,
+    loops: u32,
+    interval: f32,
+    advance_at: Option<Instant>,
     /// Tiles waiting for a paint callback to free their GL objects.
     grave: Arc<Mutex<Vec<SharedTile>>>,
 }
@@ -449,6 +484,10 @@ impl KGallery {
             pages: Vec::new(),
             paused: false,
             fullscreen: false,
+            show: false,
+            loops: 2,
+            interval: 2.0,
+            advance_at: None,
             grave: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -501,6 +540,7 @@ impl KGallery {
     }
 
     fn goto(&mut self, page: isize) {
+        self.advance_at = None;
         let count = self.page_count() as isize;
         self.cur = page.rem_euclid(count) as usize;
         if let Some(i) = self.find_page(self.cur) {
@@ -539,14 +579,20 @@ impl KGallery {
                 continue;
             }
             for t in &page.tiles {
-                if let Ok(t) = t.lock() {
+                if let Ok(mut t) = t.lock() {
+                    t.set_plays(0);
                     t.set_paused(true);
                     t.rewind();
                 }
             }
             page.started = false;
         }
-        let paused = self.paused;
+        let (paused, plays) = (self.paused, if self.show { self.loops } else { 0 });
+        for t in &self.pages[i].tiles {
+            if let Ok(mut t) = t.lock() {
+                t.set_plays(plays);
+            }
+        }
         for t in &self.pages[i].tiles {
             if let Ok(t) = t.lock() {
                 t.set_paused(paused);
@@ -555,6 +601,60 @@ impl KGallery {
         self.pages[i].started = true;
         self.shown = Some(self.cur);
         self.trim();
+    }
+
+    fn set_show(&mut self, on: bool) {
+        self.show = on;
+        self.advance_at = None;
+        let (paused, plays) = (self.paused, if on { self.loops } else { 0 });
+        if let Some(i) = self.shown.and_then(|s| self.find_page(s)) {
+            for t in &self.pages[i].tiles {
+                if let Ok(mut t) = t.lock() {
+                    t.set_plays(plays);
+                    // Tiles that stopped on their last frame play on, looping.
+                    if !on {
+                        t.rewind();
+                        t.set_paused(paused);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Slideshow timer: once every tile of the shown page played all its
+    /// plays, wait `interval`, then go to the next page (or replay a single page).
+    fn tick_show(&mut self, ctx: &egui::Context) {
+        if !self.show {
+            return;
+        }
+        let Some(i) = self.shown.and_then(|s| self.find_page(s)) else { return };
+
+        if self.advance_at.is_none() {
+            let all_done = self.pages[i].tiles.iter().all(|t| t.lock().map(|t| t.done).unwrap_or(true));
+            if all_done {
+                self.advance_at = Some(Instant::now() + Duration::from_secs_f32(self.interval));
+            }
+        }
+        let Some(at) = self.advance_at else { return };
+        let now = Instant::now();
+        if now < at {
+            ctx.request_repaint_after(at - now);
+            return;
+        }
+        self.advance_at = None;
+
+        if self.page_count() > 1 {
+            self.goto(self.cur as isize + 1);
+        } else {
+            let (paused, plays) = (self.paused, self.loops);
+            for t in &self.pages[i].tiles {
+                if let Ok(mut t) = t.lock() {
+                    t.set_plays(plays);
+                    t.rewind();
+                    t.set_paused(paused);
+                }
+            }
+        }
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) -> bool {
@@ -589,6 +689,21 @@ impl KGallery {
                 }
             }
         }
+        if pressed(Key::S) {
+            self.set_show(!self.show);
+        }
+        if pressed(Key::OpenBracket) {
+            self.loops = self.loops.saturating_sub(1).max(1);
+        }
+        if pressed(Key::CloseBracket) {
+            self.loops += 1;
+        }
+        if pressed(Key::Comma) {
+            self.interval = (self.interval - 0.5).max(0.0);
+        }
+        if pressed(Key::Period) {
+            self.interval = (self.interval + 0.5).min(3600.0);
+        }
         if pressed(Key::F) || pressed(Key::F11) {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
@@ -621,6 +736,10 @@ impl KGallery {
                     self.present();
                 }
             }
+        }
+
+        if keep_open {
+            self.tick_show(&ctx);
         }
 
         // Layout.
@@ -670,8 +789,9 @@ impl KGallery {
             callback: Arc::new(cleanup),
         });
 
+        let show = if self.show { format!(" - slideshow {}x, {:.1}s", self.loops, self.interval) } else { String::new() };
         let page_title = format!(
-            "kgallery {n}x{n} - page {}/{} - {}",
+            "kgallery {n}x{n} - page {}/{}{show} - {}",
             self.shown.unwrap_or(0) + 1,
             self.page_count(),
             self.dir.display(),

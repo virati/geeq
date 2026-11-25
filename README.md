@@ -33,6 +33,8 @@ Video mode: add `--video` (or `-V`) to either command.
 
 kgallery: press `K` (or start with `--kgallery`) to play every video of the folder together in a looping NxN grid (needs libmpv). `Left`/`Right` change page (the next and previous pages are preloaded), `+`/`-` change the grid size (up to 6x6), `Space` pauses, `F` is fullscreen, `Esc`/`Q` returns. `GEEQ_HWDEC` overrides mpv's hardware decoding (default `auto-safe`).
 
+kgallery slideshow: `S` toggles it. Each page plays every video N times (`[` / `]`, default 2), waits T seconds after the last play (`,` / `.`, default 2.0, steps of 0.5) and moves to the next page, wrapping at the end of the folder. In a grid, a clip that finished its plays holds its last frame until the longest clip on the page is done.
+
 To play the shown video, pick Player in the radial menu or the 🎞 smplayer button above the frame sheet (needs `smplayer` on `PATH`).
 
 ## Features
