@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
+mod kgallery;
 mod looks;
 
 fn config_file(name: &str) -> Option<PathBuf> {
@@ -529,6 +530,10 @@ const WHEEL_STEP: f32 = 10.0;
 const DISPLAY_MAX_SIDE: u32 = 8192;
 
 struct GeeqApp {
+    /// kgallery: the folder's videos in a looping NxN grid (`K`, or `--kgallery`).
+    kgallery: Option<kgallery::KGallery>,
+    /// Open kgallery on the first frame (`--kgallery`).
+    kgallery_at_start: bool,
     current_dir: PathBuf,
     path_input: String,
     subdirs: Vec<PathBuf>,
@@ -651,7 +656,20 @@ struct GeeqApp {
 }
 
 impl GeeqApp {
+    /// kgallery on the videos of the folder being browsed.
+    fn open_kgallery(&mut self, ctx: &egui::Context) {
+        let mut files: Vec<PathBuf> = fs::read_dir(&self.current_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_video_file(p)).collect())
+            .unwrap_or_default();
+        files.sort();
+        match kgallery::KGallery::new(ctx, self.current_dir.clone(), files) {
+            Some(g) => self.kgallery = Some(g),
+            None => self.error = Some(format!("No videos in {}", self.current_dir.display())),
+        }
+    }
+
     fn new(start_path: Option<PathBuf>, video_mode: bool, launch: &str) -> Self {
+        let kgallery_at_start = std::env::args().any(|a| a == "--kgallery");
         let photo = launch == "pgeeq";
         let start_path = start_path.map(|p| fs::canonicalize(&p).unwrap_or(p));
         let start_file = start_path.clone().filter(|p| p.is_file());
@@ -695,6 +713,8 @@ impl GeeqApp {
         let (video_tx, video_rx) = mpsc::channel();
 
         let mut app = Self {
+            kgallery: None,
+            kgallery_at_start,
             current_dir: start_dir.clone(),
             path_input: start_dir.display().to_string(),
             subdirs: Vec::new(),
@@ -2526,6 +2546,20 @@ fn read_exif(path: &Path) -> ExifInfo {
 
 impl eframe::App for GeeqApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.kgallery_at_start {
+            self.kgallery_at_start = false;
+            self.open_kgallery(ctx);
+        }
+        if let Some(gallery) = self.kgallery.as_mut() {
+            let mut outcome = kgallery::Outcome::Open;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Color32::BLACK))
+                .show(ctx, |ui| outcome = gallery.ui(ui));
+            if matches!(outcome, kgallery::Outcome::Closed) {
+                self.kgallery = None;
+            }
+            return;
+        }
         if self.radial.is_some()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
@@ -2546,6 +2580,9 @@ impl eframe::App for GeeqApp {
             }
             if !self.slideshow && ctx.input(|i| i.key_pressed(egui::Key::S)) {
                 self.start_slideshow(ctx);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::K)) {
+                self.open_kgallery(ctx);
             }
             if !self.slideshow && ctx.input(|i| i.key_pressed(egui::Key::G)) {
                 self.grid_mode = !self.grid_mode;

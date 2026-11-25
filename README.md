@@ -31,6 +31,8 @@ clicking. `C`, Options or Full in the radial menu switches to the full UI
 
 Video mode: add `--video` (or `-V`) to either command.
 
+kgallery: press `K` (or start with `--kgallery`) to play every video of the folder together in a looping NxN grid (needs libmpv). `Left`/`Right` change page (the next and previous pages are preloaded), `+`/`-` change the grid size (up to 6x6), `Space` pauses, `F` is fullscreen, `Esc`/`Q` returns. `GEEQ_HWDEC` overrides mpv's hardware decoding (default `auto-safe`).
+
 To play the shown video, pick Player in the radial menu or the 🎞 smplayer button above the frame sheet (needs `smplayer` on `PATH`).
 
 ## Features
