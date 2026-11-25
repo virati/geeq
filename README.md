@@ -31,7 +31,15 @@ clicking. `C`, Options or Full in the radial menu switches to the full UI
 
 Video mode: add `--video` (or `-V`) to either command.
 
-kgallery: press `K` (or start with `--kgallery`) to play every video of the folder together in a looping NxN grid (needs libmpv). `Left`/`Right` change page (the next and previous pages are preloaded), `+`/`-` change the grid size (up to 6x6), `Space` pauses, `F` is fullscreen, `Esc`/`Q` returns. `GEEQ_HWDEC` overrides mpv's hardware decoding (default `auto-safe`).
+kgallery: press `K` (or start with `--kgallery`) to play every video of the folder together in a looping NxN grid (needs libmpv). `Left`/`Right` change page (the next and previous pages are preloaded), `+`/`-` change the grid size (columns x rows, up to 8x6, not always square), `Space` pauses, `F11` is fullscreen, `Esc`/`Q` returns. `GEEQ_HWDEC` overrides mpv's hardware decoding (default `auto-safe`).
+
+kgallery grid: `--nn 5` (or `--nn=5`) makes it a square 5x5 grid (1 to 6). Without it the grid is picked from the number of videos.
+
+kgallery shuffle: `geeq --kgallery --shuffle` starts every video at a random spot (0 to 90 percent of its length). Paging back to a page, and the slideshow replay, pick new random spots. After the first pass each clip loops from its start.
+
+kgallery sound output: always the HDMI out (`pulse/alsa_output.pci-0000_01_00.1.hdmi-stereo`); `GEEQ_AUDIO_DEVICE` overrides it.
+
+kgallery sound: one tile has the sound, framed in yellow. By default it is the tile under the mouse; `R` cycles through the tiles every 5 seconds, `F` goes back to the tile under the mouse (`A` toggles between the two). `M` mutes and unmutes (the title shows "muted").
 
 kgallery slideshow: `S` toggles it. Each page plays every video N times (`[` / `]`, default 2), waits T seconds after the last play (`,` / `.`, default 2.0, steps of 0.5) and moves to the next page, wrapping at the end of the folder. In a grid, a clip that finished its plays holds its last frame until the longest clip on the page is done.
 

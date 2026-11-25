@@ -19,14 +19,53 @@ use eframe::{egui, egui_glow, glow};
 use glow::HasContext as _;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const MAX_N: usize = 6;
-const DEFAULT_MAX_N: usize = 4;
+const MAX_COLS: usize = 8;
+const MAX_ROWS: usize = 6;
+
+/// Grid (columns, rows) for `count` videos. `dir` 0: the grid with the fewest empty cells whose tiles
+/// are closest to the video shape; +1 / -1: the next bigger / smaller grid than `per` cells.
+fn pick_grid(count: usize, per: usize, dir: i32) -> Option<(usize, usize)> {
+    let mut best: Option<(f64, (usize, usize))> = None;
+    for rows in 1..=MAX_ROWS {
+        for cols in 1..=MAX_COLS {
+            let cells = cols * rows;
+            let shape = (rows as f64 / cols as f64).ln().abs(); // 0 when tiles are 16:9 in a 16:9 window
+            let key = match dir {
+                0 if cells >= count => shape + (cells - count) as f64 / cells as f64,
+                0 => 1000.0 + (count - cells) as f64,
+                d if d > 0 && cells > per => cells as f64 * 100.0 + shape,
+                d if d < 0 && cells < per => -(cells as f64) * 100.0 + shape,
+                _ => continue,
+            };
+            if best.map_or(true, |(k, _)| key < k) {
+                best = Some((key, (cols, rows)));
+            }
+        }
+    }
+    best.map(|(_, g)| g)
+}
 /// A page that is still not ready after this long starts anyway.
 const START_TIMEOUT: Duration = Duration::from_secs(20);
-const GAP: f32 = 2.0;
+const GAP: f32 = 0.0;
+const CYCLE_SECS: u64 = 5;
+/// The HDMI sink (Acer monitor) as PulseAudio names it.
+const DEFAULT_AUDIO_DEVICE: &str = "pulse/alsa_output.pci-0000_01_00.1.hdmi-stereo";
+
+/// `--shuffle`: every tile starts at a random spot of its video.
+static SHUFFLE: AtomicBool = AtomicBool::new(false);
+static SEED: AtomicU64 = AtomicU64::new(0);
+
+/// Random start position, 0..90 percent of the clip (splitmix64).
+fn random_percent() -> u32 {
+    let mut z = SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) % 90) as u32
+}
 
 mod ffi {
     use super::*;
@@ -156,6 +195,8 @@ struct GlTile {
     armed: bool,
     /// Slideshow: played all its plays (or cannot play).
     done: bool,
+    /// Audio track on (only one tile at a time).
+    audible: bool,
 }
 
 // Raw pointers are only used from the UI thread.
@@ -177,6 +218,7 @@ impl GlTile {
             failed: false,
             armed: false,
             done: false,
+            audible: false,
         };
 
         unsafe {
@@ -186,7 +228,7 @@ impl GlTile {
                 return t;
             }
             let hwdec = std::env::var("GEEQ_HWDEC").unwrap_or_else(|_| "auto-safe".to_string());
-            let options: [(&str, &str); 22] = [
+            let options: [(&str, &str); 23] = [
                 ("config", "no"),
                 ("terminal", "no"),
                 ("load-scripts", "no"),
@@ -210,12 +252,20 @@ impl GlTile {
                 ("idle", "yes"), // else mpv quits before the file is loaded
                 ("really-quiet", "yes"),
                 ("keepaspect", "yes"),
+                // Fill the whole cell (crop the overflow) so no black bars separate the tiles.
+                ("panscan", "1.0"),
             ];
             for (k, v) in options {
                 let (k, v) = (cstr(k), cstr(v));
                 if ffi::mpv_set_option_string(m, k.as_ptr(), v.as_ptr()) < 0 {
                     eprintln!("kgallery: mpv option {k:?}={v:?} refused");
                 }
+            }
+            // Sound always goes to the HDMI out (the Acer); GEEQ_AUDIO_DEVICE overrides (mpv --audio-device=help lists them).
+            let device = std::env::var("GEEQ_AUDIO_DEVICE").unwrap_or_else(|_| DEFAULT_AUDIO_DEVICE.to_string());
+            let (k, v) = (cstr("audio-device"), cstr(&device));
+            if ffi::mpv_set_option_string(m, k.as_ptr(), v.as_ptr()) < 0 {
+                eprintln!("kgallery: audio device {device} refused");
             }
             let err = ffi::mpv_initialize(m);
             if err < 0 {
@@ -246,6 +296,15 @@ impl GlTile {
         unsafe { ffi::mpv_set_property_string(self.mpv, n.as_ptr(), v.as_ptr()) };
     }
 
+    /// Audio on for this tile only; the others have no audio track at all.
+    fn set_audible(&mut self, on: bool) {
+        if self.audible == on {
+            return;
+        }
+        self.audible = on;
+        self.set_property("aid", if on { "auto" } else { "no" });
+    }
+
     fn set_paused(&self, paused: bool) {
         self.set_property("pause", if paused { "yes" } else { "no" });
     }
@@ -262,7 +321,11 @@ impl GlTile {
         if self.mpv.is_null() {
             return;
         }
-        let args = [cstr("seek"), cstr("0"), cstr("absolute+exact")];
+        let args = if SHUFFLE.load(Ordering::Relaxed) {
+            [cstr("seek"), cstr(&random_percent().to_string()), cstr("absolute-percent+exact")]
+        } else {
+            [cstr("seek"), cstr("0"), cstr("absolute+exact")]
+        };
         let mut ptrs: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
         ptrs.push(std::ptr::null());
         unsafe { ffi::mpv_command_async(self.mpv, 0, ptrs.as_mut_ptr()) };
@@ -322,6 +385,11 @@ impl GlTile {
 
         if !self.load_sent {
             self.load_sent = true;
+            if SHUFFLE.load(Ordering::Relaxed) {
+                // Applies to the file loaded next.
+                let (k, v) = (cstr("start"), cstr(&format!("{}%", random_percent())));
+                ffi::mpv_set_option_string(self.mpv, k.as_ptr(), v.as_ptr());
+            }
             let path = cstr(&self.path.to_string_lossy());
             let args = [cstr("loadfile"), path, cstr("replace")];
             let mut ptrs: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
@@ -440,6 +508,15 @@ impl Page {
     }
 }
 
+/// Which tile has the sound.
+#[derive(Clone, Copy, PartialEq)]
+enum AudioMode {
+    /// The tile under the mouse.
+    Hover,
+    /// Each tile in turn, every `CYCLE_SECS`.
+    Cycle,
+}
+
 pub enum Outcome {
     Open,
     Closed,
@@ -449,7 +526,8 @@ pub struct KGallery {
     ctx: egui::Context,
     dir: PathBuf,
     files: Vec<PathBuf>,
-    n: usize,
+    cols: usize,
+    rows: usize,
     /// Page the user asked for.
     cur: usize,
     /// Page on screen.
@@ -463,6 +541,12 @@ pub struct KGallery {
     loops: u32,
     interval: f32,
     advance_at: Option<Instant>,
+    audio: AudioMode,
+    /// `M`: no tile has the sound.
+    muted: bool,
+    /// Tile (index in the shown page) that has the sound.
+    active: usize,
+    cycle_at: Instant,
     /// Tiles waiting for a paint callback to free their GL objects.
     grave: Arc<Mutex<Vec<SharedTile>>>,
 }
@@ -473,12 +557,26 @@ impl KGallery {
         if files.is_empty() {
             return None;
         }
-        let n = ((files.len() as f64).sqrt().ceil() as usize).clamp(1, DEFAULT_MAX_N);
+        SHUFFLE.store(std::env::args().any(|a| a == "--shuffle"), Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        SEED.store(nanos, Ordering::Relaxed);
+        // `--nn 5` (or `--nn=5`): a square NxN grid.
+        let args: Vec<String> = std::env::args().collect();
+        let nn = args.iter().enumerate().find_map(|(i, a)| match a.strip_prefix("--nn=") {
+            Some(v) => v.parse::<usize>().ok(),
+            None if a == "--nn" => args.get(i + 1).and_then(|v| v.parse::<usize>().ok()),
+            None => None,
+        });
+        let (cols, rows) = match nn {
+            Some(n) => (n.clamp(1, MAX_ROWS), n.clamp(1, MAX_ROWS)),
+            None => pick_grid(files.len(), 0, 0).unwrap_or((1, 1)),
+        };
         Some(KGallery {
             ctx: ctx.clone(),
             dir,
             files,
-            n,
+            cols,
+            rows,
             cur: 0,
             shown: None,
             pages: Vec::new(),
@@ -488,12 +586,16 @@ impl KGallery {
             loops: 2,
             interval: 2.0,
             advance_at: None,
+            audio: AudioMode::Hover,
+            muted: false,
+            active: 0,
+            cycle_at: Instant::now(),
             grave: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
     fn page_count(&self) -> usize {
-        let per = self.n * self.n;
+        let per = self.cols * self.rows;
         self.files.len().div_ceil(per).max(1)
     }
 
@@ -502,7 +604,7 @@ impl KGallery {
     }
 
     fn new_page(&self, index: usize) -> Page {
-        let per = self.n * self.n;
+        let per = self.cols * self.rows;
         let tiles = self
             .files
             .iter()
@@ -553,18 +655,21 @@ impl KGallery {
         self.trim();
     }
 
-    fn set_n(&mut self, n: usize) {
-        let n = n.clamp(1, MAX_N);
-        if n == self.n {
+    /// A bigger (`dir` > 0) or smaller (`dir` < 0) grid.
+    fn set_grid(&mut self, dir: i32) {
+        let per = self.cols * self.rows;
+        let Some((cols, rows)) = pick_grid(self.files.len(), per, dir) else { return };
+        if (cols, rows) == (self.cols, self.rows) {
             return;
         }
-        let first_file = self.cur * self.n * self.n;
+        let first_file = self.cur * per;
         for p in std::mem::take(&mut self.pages) {
             self.bury(p);
         }
         self.shown = None;
-        self.n = n;
-        self.goto((first_file / (n * n)) as isize);
+        self.cols = cols;
+        self.rows = rows;
+        self.goto((first_file / (cols * rows)) as isize);
     }
 
     /// Make the wanted page the visible one if it is ready: stop the others
@@ -674,10 +779,10 @@ impl KGallery {
             self.goto(0);
         }
         if pressed(Key::Plus) || pressed(Key::Equals) {
-            self.set_n(self.n + 1);
+            self.set_grid(1);
         }
         if pressed(Key::Minus) {
-            self.set_n(self.n.saturating_sub(1));
+            self.set_grid(-1);
         }
         if pressed(Key::Space) {
             self.paused = !self.paused;
@@ -688,6 +793,13 @@ impl KGallery {
                     }
                 }
             }
+        }
+        if pressed(Key::M) {
+            self.muted = !self.muted;
+        }
+        if pressed(Key::A) {
+            self.audio = if self.audio == AudioMode::Hover { AudioMode::Cycle } else { AudioMode::Hover };
+            self.cycle_at = Instant::now();
         }
         if pressed(Key::S) {
             self.set_show(!self.show);
@@ -704,7 +816,14 @@ impl KGallery {
         if pressed(Key::Period) {
             self.interval = (self.interval + 0.5).min(3600.0);
         }
-        if pressed(Key::F) || pressed(Key::F11) {
+        if pressed(Key::R) && self.audio != AudioMode::Cycle {
+            self.audio = AudioMode::Cycle;
+            self.cycle_at = Instant::now();
+        }
+        if pressed(Key::F) {
+            self.audio = AudioMode::Hover;
+        }
+        if pressed(Key::F11) {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
@@ -745,17 +864,53 @@ impl KGallery {
         // Layout.
         let rect = ui.available_rect_before_wrap();
         let ppp = ctx.pixels_per_point();
-        let n = self.n as f32;
-        let cell = egui::vec2((rect.width() - GAP * (n - 1.0)) / n, (rect.height() - GAP * (n - 1.0)) / n);
+        let (cols, rows) = (self.cols as f32, self.rows as f32);
+        let cell = egui::vec2((rect.width() - GAP * (cols - 1.0)) / cols, (rect.height() - GAP * (rows - 1.0)) / rows);
         let px = ((cell.x * ppp).round() as i32, (cell.y * ppp).round() as i32);
         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
 
         let shown = self.shown;
+
+        // Sound: one tile at a time, under the mouse or in turn.
+        let count = shown.and_then(|s| self.find_page(s)).map_or(0, |i| self.pages[i].tiles.len());
+        if keep_open && count > 0 {
+            match self.audio {
+                AudioMode::Hover => {
+                    let hovered = ctx.input(|i| i.pointer.hover_pos()).and_then(|p| {
+                        if !rect.contains(p) {
+                            return None;
+                        }
+                        let col = ((p.x - rect.min.x) / (cell.x + GAP)) as usize;
+                        let row = ((p.y - rect.min.y) / (cell.y + GAP)) as usize;
+                        (col < self.cols && row < self.rows).then_some(row * self.cols + col)
+                    });
+                    if let Some(h) = hovered.filter(|h| *h < count) {
+                        self.active = h;
+                    }
+                }
+                AudioMode::Cycle => {
+                    if self.cycle_at.elapsed() >= Duration::from_secs(CYCLE_SECS) {
+                        self.active += 1;
+                        self.cycle_at = Instant::now();
+                    }
+                }
+            }
+            self.active %= count;
+            for page in &self.pages {
+                let visible = Some(page.index) == shown;
+                for (i, tile) in page.tiles.iter().enumerate() {
+                    if let Ok(mut t) = tile.lock() {
+                        t.set_audible(visible && i == self.active && !self.muted);
+                    }
+                }
+            }
+        }
+
         if keep_open {
             for page in &self.pages {
                 for (i, tile) in page.tiles.iter().enumerate() {
                     let visible = Some(page.index) == shown;
-                    let pos = rect.min + egui::vec2((i % self.n) as f32 * (cell.x + GAP), (i / self.n) as f32 * (cell.y + GAP));
+                    let pos = rect.min + egui::vec2((i % self.cols) as f32 * (cell.x + GAP), (i / self.cols) as f32 * (cell.y + GAP));
                     // A page that is not shown still needs paint calls to keep decoding: a 1x1 rect does that.
                     let tile_rect = if visible { egui::Rect::from_min_size(pos, cell) } else { egui::Rect::from_min_size(pos, egui::vec2(1.0, 1.0)) };
                     let tile = tile.clone();
@@ -766,6 +921,16 @@ impl KGallery {
                     });
                     ui.painter().add(egui::PaintCallback { rect: tile_rect, callback: Arc::new(callback) });
                 }
+            }
+            // Frame the tile that has the sound (after the video callbacks, so it draws on top).
+            if count > 0 && !self.muted {
+                let pos = rect.min + egui::vec2((self.active % self.cols) as f32 * (cell.x + GAP), (self.active / self.cols) as f32 * (cell.y + GAP));
+                ui.painter().rect_stroke(
+                    egui::Rect::from_min_size(pos, cell),
+                    0.0,
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 0)),
+                    egui::StrokeKind::Inside,
+                );
             }
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         } else {
@@ -790,12 +955,18 @@ impl KGallery {
         });
 
         let show = if self.show { format!(" - slideshow {}x, {:.1}s", self.loops, self.interval) } else { String::new() };
+        let sound = match (self.muted, self.audio) {
+            (true, _) => "muted".to_string(),
+            (false, AudioMode::Hover) => "sound: mouse".to_string(),
+            (false, AudioMode::Cycle) => format!("sound: every {CYCLE_SECS}s"),
+        };
         let page_title = format!(
-            "kgallery {n}x{n} - page {}/{}{show} - {}",
+            "kgallery {}x{} - page {}/{}{show} - {sound} - {}",
+            self.cols,
+            self.rows,
             self.shown.unwrap_or(0) + 1,
             self.page_count(),
             self.dir.display(),
-            n = self.n
         );
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(page_title));
 
