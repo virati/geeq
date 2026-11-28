@@ -3722,8 +3722,18 @@ impl GeeqApp {
                         area = area.scroll_offset(egui::Vec2::ZERO);
                     }
                     area.show(ui, |ui| {
-                        ui.set_min_size(avail);
-                        ui.centered_and_justified(add_image);
+                        // Reserve max(picture, viewport) from the scroll
+                        // origin and center the picture inside it by hand.
+                        // A centered layout would centre an over-wide
+                        // picture on the viewport instead, pushing half of
+                        // the overflow left of the origin where no scroll
+                        // offset can reach it ("can't move left" when
+                        // zoomed). This also matches the padding assumed by
+                        // `zoom_center_fraction`.
+                        let region = egui::vec2(screen_size.x.max(avail.x), screen_size.y.max(avail.y));
+                        let (region_rect, _) = ui.allocate_exact_size(region, egui::Sense::hover());
+                        let picture_rect = egui::Rect::from_center_size(region_rect.center(), alloc_size);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(picture_rect), add_image);
                     });
 
                     if let Some(exif) = &loaded.exif {
