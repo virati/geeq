@@ -11,7 +11,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
+mod kgallery;
 mod looks;
+mod rawpull;
+
+/// Number keys 1-9: numbered tags, or looks while filter mode is on.
+const DIGIT_KEYS: [egui::Key; 9] = [
+    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+    egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
+    egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+];
+const TAG_COUNT: usize = DIGIT_KEYS.len();
+
+/// Messages from a running raw pull back to the UI thread.
+enum PullEvent {
+    Progress(usize),
+    Done(rawpull::Summary),
+}
+
+/// A background copy of one tag's raws off the camera card.
+struct TagPull {
+    tag: usize,
+    total: usize,
+    done: usize,
+    rx: mpsc::Receiver<PullEvent>,
+}
+
+/// What a button in the tags popup asked for.
+enum TagAction {
+    Copy,
+    Pull,
+    Clear,
+    Dismiss,
+}
 
 fn config_file(name: &str) -> Option<PathBuf> {
     let config_home = std::env::var("XDG_CONFIG_HOME")
@@ -31,6 +63,18 @@ fn looks_path_file() -> Option<PathBuf> {
     config_file("looks_path.txt")
 }
 
+
+/// Optional: the camera card's mount point (or its DCIM folder), for when
+/// it should not be searched for under /run/media and /media.
+fn card_root_file() -> Option<PathBuf> {
+    config_file("card_root.txt")
+}
+
+fn load_card_root() -> Option<PathBuf> {
+    let text = fs::read_to_string(card_root_file()?).ok()?;
+    let line = text.trim();
+    (!line.is_empty()).then(|| PathBuf::from(line))
+}
 
 /// Whether geeq opens in the thumbnail grid instead of the single-image view.
 fn start_in_grid_file() -> Option<PathBuf> {
@@ -276,6 +320,68 @@ fn save_video_listing(v: VideoListing) {
     let _ = fs::write(path, text);
 }
 
+/// Whether a file type (PDFs, camera raws) is listed; saved as `1`/`0` in
+/// `~/.config/geeq/<name>`. Missing file means shown.
+fn load_shown(name: &str) -> bool {
+    config_file(name)
+        .and_then(|f| fs::read_to_string(f).ok())
+        .is_none_or(|t| t.trim() != "0")
+}
+
+fn save_shown(name: &str, on: bool) {
+    let Some(path) = config_file(name) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, if on { "1\n" } else { "0\n" });
+}
+
+/// File list order, cycled by the sort button: name (A→Z), time (newest
+/// first), size (largest first). Folders always list by name.
+#[derive(Clone, Copy, PartialEq)]
+enum SortBy {
+    Name,
+    Time,
+    Size,
+}
+
+impl SortBy {
+    fn next(self) -> Self {
+        match self {
+            SortBy::Name => SortBy::Time,
+            SortBy::Time => SortBy::Size,
+            SortBy::Size => SortBy::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SortBy::Name => "name",
+            SortBy::Time => "time",
+            SortBy::Size => "size",
+        }
+    }
+}
+
+fn load_sort_by() -> SortBy {
+    match config_file("sort.txt").and_then(|f| fs::read_to_string(f).ok()).as_deref().map(str::trim) {
+        Some("time") => SortBy::Time,
+        Some("size") => SortBy::Size,
+        _ => SortBy::Name,
+    }
+}
+
+fn save_sort_by(v: SortBy) {
+    let Some(path) = config_file("sort.txt") else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, format!("{}\n", v.label()));
+}
+
+const SHOW_PDFS_FILE: &str = "show_pdfs.txt";
+const SHOW_RAWS_FILE: &str = "show_raws.txt";
+
 /// Drag-and-drop payload: a file dragged from the list or grid onto a folder.
 struct DraggedFile(PathBuf);
 
@@ -322,10 +428,23 @@ fn probe_video(path: &Path) -> Result<VideoInfo, String> {
 /// One frame at `secs`, scaled to `width` wide. Input-side seeking jumps to
 /// the nearest keyframe first, so this stays fast even deep into a file.
 fn video_frame(path: &Path, secs: f64, width: u32) -> Result<ColorImage, String> {
+    video_frame_vf(path, secs, &format!("scale={width}:-2"))
+}
+
+/// The same frame as `video_frame` at the video's own resolution, shrunk
+/// only if a side is over `max_side` (the GPU's texture limit).
+fn video_frame_full(path: &Path, secs: f64, max_side: usize) -> Result<ColorImage, String> {
+    let vf = format!(
+        "scale='min(iw,{max_side})':'min(ih,{max_side})':force_original_aspect_ratio=decrease"
+    );
+    video_frame_vf(path, secs, &vf)
+}
+
+fn video_frame_vf(path: &Path, secs: f64, vf: &str) -> Result<ColorImage, String> {
     let out = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-ss", &format!("{secs:.3}"), "-i"])
         .arg(path)
-        .args(["-frames:v", "1", "-an", "-sn", "-vf", &format!("scale={width}:-2")])
+        .args(["-frames:v", "1", "-an", "-sn", "-vf", vf])
         .args(["-f", "image2pipe", "-c:v", "ppm", "-"])
         .output()
         .map_err(|e| format!("ffmpeg not available: {e}"))?;
@@ -365,6 +484,10 @@ struct VideoView {
     error: Option<String>,
     /// A preview frame shown large instead of the contact sheet.
     enlarged: Option<usize>,
+    /// Full-resolution copies of the enlarged frame and its neighbours,
+    /// drawn over the preview once they land.
+    full: HashMap<usize, TextureHandle>,
+    full_pending: HashSet<usize>,
 }
 
 impl VideoView {
@@ -385,6 +508,7 @@ impl VideoView {
 enum VideoMsg {
     Info(u64, VideoInfo),
     Frame(u64, usize, ColorImage),
+    Full(u64, usize, ColorImage),
     Error(u64, String),
 }
 
@@ -511,6 +635,10 @@ const WHEEL_STEP: f32 = 10.0;
 const DISPLAY_MAX_SIDE: u32 = 8192;
 
 struct GeeqApp {
+    /// kgallery: the folder's videos in a looping NxN grid (`K`, or `--kgallery`).
+    kgallery: Option<kgallery::KGallery>,
+    /// Open kgallery on the first frame (`--kgallery`).
+    kgallery_at_start: bool,
     current_dir: PathBuf,
     path_input: String,
     subdirs: Vec<PathBuf>,
@@ -535,6 +663,14 @@ struct GeeqApp {
     /// touch the file on disk.
     rotation: u8,
     clip_stack: Vec<PathBuf>,
+    /// Numbered tags 1-9 (index 0-8): the files carrying each one, in the
+    /// order they were tagged.
+    tags: [Vec<PathBuf>; TAG_COUNT],
+    /// Per tagged file, its tags as "[1,3]", for the lists and the caption.
+    tag_marks: HashMap<PathBuf, String>,
+    /// The raw pull in flight, and the outcome line of the last one.
+    tag_pull: Option<TagPull>,
+    tag_status: String,
     /// Looks exported from snaplite, and the live filter mode that applies
     /// them to whatever image is shown.
     looks_lib: Vec<looks::Look>,
@@ -616,6 +752,10 @@ struct GeeqApp {
     /// `--video`: list only videos and always load their previews.
     video_mode: bool,
     video_listing: VideoListing,
+    /// PDFs and camera raws are listed (the PDF / Raw dropdowns).
+    show_pdfs: bool,
+    show_raws: bool,
+    sort_by: SortBy,
     video: Option<VideoView>,
     video_tx: mpsc::Sender<VideoMsg>,
     video_rx: mpsc::Receiver<VideoMsg>,
@@ -633,7 +773,20 @@ struct GeeqApp {
 }
 
 impl GeeqApp {
+    /// kgallery on the videos of the folder being browsed.
+    fn open_kgallery(&mut self, ctx: &egui::Context) {
+        let mut files: Vec<PathBuf> = fs::read_dir(&self.current_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_video_file(p)).collect())
+            .unwrap_or_default();
+        files.sort();
+        match kgallery::KGallery::new(ctx, self.current_dir.clone(), files) {
+            Some(g) => self.kgallery = Some(g),
+            None => self.error = Some(format!("No videos in {}", self.current_dir.display())),
+        }
+    }
+
     fn new(start_path: Option<PathBuf>, video_mode: bool, launch: &str) -> Self {
+        let kgallery_at_start = std::env::args().any(|a| a == "--kgallery");
         let photo = launch == "pgeeq";
         let start_path = start_path.map(|p| fs::canonicalize(&p).unwrap_or(p));
         let start_file = start_path.clone().filter(|p| p.is_file());
@@ -677,6 +830,8 @@ impl GeeqApp {
         let (video_tx, video_rx) = mpsc::channel();
 
         let mut app = Self {
+            kgallery: None,
+            kgallery_at_start,
             current_dir: start_dir.clone(),
             path_input: start_dir.display().to_string(),
             subdirs: Vec::new(),
@@ -695,6 +850,10 @@ impl GeeqApp {
             wheel_accum: 0.0,
             rotation: 0,
             clip_stack: Vec::new(),
+            tags: Default::default(),
+            tag_marks: HashMap::new(),
+            tag_pull: None,
+            tag_status: String::new(),
             looks_lib: Vec::new(),
             looks_path: None,
             looks_error: None,
@@ -739,6 +898,9 @@ impl GeeqApp {
             show_dir_stats: photo,
             video_mode,
             video_listing: load_video_listing(),
+            show_pdfs: load_shown(SHOW_PDFS_FILE),
+            show_raws: load_shown(SHOW_RAWS_FILE),
+            sort_by: load_sort_by(),
             video: None,
             video_tx,
             video_rx,
@@ -833,6 +995,12 @@ impl GeeqApp {
         if self.video_mode {
             return is_video_file(path);
         }
+        if is_pdf_file(path) {
+            return self.show_pdfs;
+        }
+        if is_raw_file(path) {
+            return self.show_raws;
+        }
         is_image_file(path) || (self.video_listing != VideoListing::Hide && is_video_file(path))
     }
 
@@ -872,6 +1040,16 @@ impl GeeqApp {
             .sort_by_key(|p| p.file_name().unwrap_or_default().to_ascii_lowercase());
         self.files
             .sort_by_key(|p| p.file_name().unwrap_or_default().to_ascii_lowercase());
+        // Stable sorts, so equal times/sizes stay in name order.
+        match self.sort_by {
+            SortBy::Name => {}
+            SortBy::Time => self.files.sort_by_cached_key(|p| {
+                std::cmp::Reverse(fs::metadata(p).and_then(|m| m.modified()).ok())
+            }),
+            SortBy::Size => self.files.sort_by_cached_key(|p| {
+                std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            }),
+        }
 
         self.path_input = self.current_dir.display().to_string();
 
@@ -983,6 +1161,8 @@ impl GeeqApp {
             loading: false,
             error: None,
             enlarged: None,
+            full: HashMap::new(),
+            full_pending: HashSet::new(),
         });
         if self.loads_videos() {
             self.load_video_preview();
@@ -1044,6 +1224,102 @@ impl GeeqApp {
         self.record_activity();
     }
 
+    /// A tag's files, shell-quoted and space-separated like the clip stack.
+    fn tag_text(&self, tag: usize) -> String {
+        self.tags[tag].iter().map(|p| shell_quote(p)).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Number key `tag` (0-8) on a photo: toggles the tag and, like the
+    /// clip stack, puts the tag's whole list on the clipboard.
+    fn toggle_tag(&mut self, ctx: &egui::Context, tag: usize, path: PathBuf) {
+        let list = &mut self.tags[tag];
+        match list.iter().position(|p| *p == path) {
+            Some(pos) => {
+                list.remove(pos);
+            }
+            None => list.push(path),
+        }
+        self.rebuild_tag_marks();
+        ctx.copy_text(self.tag_text(tag));
+        self.record_activity();
+    }
+
+    fn clear_tag(&mut self, tag: usize) {
+        self.tags[tag].clear();
+        self.rebuild_tag_marks();
+    }
+
+    fn rebuild_tag_marks(&mut self) {
+        let mut numbers: HashMap<&PathBuf, Vec<String>> = HashMap::new();
+        for (i, list) in self.tags.iter().enumerate() {
+            for path in list {
+                numbers.entry(path).or_default().push((i + 1).to_string());
+            }
+        }
+        self.tag_marks = numbers
+            .into_iter()
+            .map(|(path, nums)| (path.clone(), format!("[{}]", nums.join(","))))
+            .collect();
+    }
+
+    /// Copies the raws of every file in tag `tag` from the camera card to
+    /// next to each file, on a background thread.
+    fn start_pull(&mut self, ctx: &egui::Context, tag: usize) {
+        if self.tag_pull.is_some() || self.tags[tag].is_empty() {
+            return;
+        }
+        let dcims = rawpull::card_dcims(load_card_root().as_deref());
+        if dcims.is_empty() {
+            self.tag_status = "No camera card found: mount the card (it needs a DCIM folder), or put its path in ~/.config/geeq/card_root.txt".to_string();
+            return;
+        }
+        let files = self.tags[tag].clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let total = files.len();
+        thread::spawn(move || {
+            let mut index = rawpull::CardIndex::new(dcims);
+            let summary = rawpull::pull(&files, &mut index, |done| {
+                let _ = tx.send(PullEvent::Progress(done));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(PullEvent::Done(summary));
+            ctx.request_repaint();
+        });
+        self.tag_status.clear();
+        self.tag_pull = Some(TagPull { tag, total, done: 0, rx });
+    }
+
+    /// Picks up progress and the final summary of a running raw pull.
+    fn drain_pull(&mut self) {
+        let Some(pull) = self.tag_pull.as_mut() else { return };
+        let tag = pull.tag;
+        let mut summary = None;
+        let mut lost = false;
+        loop {
+            match pull.rx.try_recv() {
+                Ok(PullEvent::Progress(done)) => pull.done = done,
+                Ok(PullEvent::Done(s)) => summary = Some(s),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    lost = summary.is_none();
+                    break;
+                }
+            }
+        }
+        if let Some(summary) = summary {
+            self.tag_status = summary.describe(tag + 1);
+            self.tag_pull = None;
+            if summary.copied > 0 {
+                // The new raws sit next to their photos: list them.
+                self.rescan_dir();
+            }
+        } else if lost {
+            self.tag_status = format!("Tag {}: the pull stopped unexpectedly", tag + 1);
+            self.tag_pull = None;
+        }
+    }
+
     /// Kicks off a background thumbnail decode for the clip-stack popup,
     /// unless one's already cached or in flight for this path.
     fn ensure_thumbnail(&mut self, path: PathBuf) {
@@ -1083,6 +1359,35 @@ impl GeeqApp {
         }
     }
 
+    /// Moves to the next sort order and re-lists, keeping the open file
+    /// selected and scrolled into view.
+    fn cycle_sort(&mut self) {
+        self.sort_by = self.sort_by.next();
+        save_sort_by(self.sort_by);
+        self.rescan_dir();
+        self.list_scroll_pending = true;
+        self.grid_scroll_pending = true;
+    }
+
+    /// Re-lists after the PDF or Raw setting changes. If the open file is
+    /// now hidden, the first listed file opens instead.
+    fn apply_type_filter(&mut self) {
+        let open = self.selected_file.clone();
+        self.rescan_dir();
+        self.spawn_dir_scans();
+        if let Some(path) = open {
+            if !self.lists_file(&path) {
+                self.loaded = None;
+                self.video = None;
+                self.selected_file = None;
+                self.selected_index = None;
+                if !self.files.is_empty() {
+                    self.open_index(0);
+                }
+            }
+        }
+    }
+
     /// Moves `file` into `dir` (rename, or copy + delete across
     /// filesystems), refusing to overwrite. The clip stack follows the file
     /// to its new path, and if it was the open file the next one opens.
@@ -1109,8 +1414,14 @@ impl GeeqApp {
         self.error = None;
 
         if let Some(entry) = self.clip_stack.iter_mut().find(|p| **p == file) {
-            *entry = dest;
+            *entry = dest.clone();
             ctx.copy_text(self.clip_stack_text());
+        }
+        if self.tag_marks.contains_key(&file) {
+            for entry in self.tags.iter_mut().flatten().filter(|p| **p == file) {
+                *entry = dest.clone();
+            }
+            self.rebuild_tag_marks();
         }
         self.exposure_points.retain(|p| p.path != file);
         self.sharpness_points.retain(|p| p.path != file);
@@ -1170,6 +1481,26 @@ impl GeeqApp {
                 ui.close();
             }
         });
+    }
+
+    /// A Show/Hide dropdown for one file type, next to the Video one.
+    /// Returns true when the setting changed.
+    fn shown_menu(ui: &mut egui::Ui, label: &str, shown: &mut bool, file: &str) -> bool {
+        let state = if *shown { "shown" } else { "hidden" };
+        let mut changed = false;
+        ui.menu_button(format!("{label}: {state} ⏷"), |ui| {
+            for (on, text) in [(true, "Show"), (false, "Hide")] {
+                if ui.radio(*shown == on, text).clicked() {
+                    if *shown != on {
+                        *shown = on;
+                        save_shown(file, on);
+                        changed = true;
+                    }
+                    ui.close();
+                }
+            }
+        });
+        changed
     }
 
     fn clear_clip_stack(&mut self, ctx: &egui::Context) {
@@ -1403,7 +1734,10 @@ impl GeeqApp {
 
         while let Ok(msg) = self.video_rx.try_recv() {
             let gen = match &msg {
-                VideoMsg::Info(g, _) | VideoMsg::Frame(g, _, _) | VideoMsg::Error(g, _) => *g,
+                VideoMsg::Info(g, _)
+                | VideoMsg::Frame(g, _, _)
+                | VideoMsg::Full(g, _, _)
+                | VideoMsg::Error(g, _) => *g,
             };
             if gen != self.generation {
                 continue;
@@ -1417,11 +1751,17 @@ impl GeeqApp {
                         video.received += 1;
                     }
                 }
+                VideoMsg::Full(_, i, frame) => {
+                    video.full_pending.remove(&i);
+                    let texture = ctx.load_texture(format!("vfull:{i}"), frame, TextureOptions::LINEAR);
+                    video.full.insert(i, texture);
+                }
                 VideoMsg::Error(_, err) => video.error = Some(err),
             }
         }
         if let Some(video) = &self.video {
-            if video.loading && video.error.is_none() && video.received < video.expected() {
+            let frames_due = video.loading && video.error.is_none() && video.received < video.expected();
+            if frames_due || !video.full_pending.is_empty() {
                 // Frames that fail to extract never arrive; poll gently.
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
@@ -1780,6 +2120,10 @@ impl GeeqApp {
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
                         let name = if self.clip_stack.contains(&path) { format!("📋 {name}") } else { name };
+                        let name = match self.tag_marks.get(&path) {
+                            Some(marks) => format!("{marks} {name}"),
+                            None => name,
+                        };
                         let label_rect = egui::Rect::from_min_max(
                             egui::pos2(rect.min.x + 4.0, rect.max.y - GRID_LABEL_H),
                             egui::pos2(rect.max.x - 4.0, rect.max.y),
@@ -1896,26 +2240,41 @@ impl GeeqApp {
                 let n = expected.max(1);
                 video.enlarged = Some(if right { (i + 1) % n } else { (i + n - 1) % n });
             }
-            if let Some(texture) = video.enlarged.and_then(|i| video.frames[i].as_ref()) {
-                let size = texture.size_vec2();
-                let scale = (rect.width() / size.x).min((rect.height() - 20.0) / size.y);
-                let img = egui::Rect::from_center_size(rect.center(), size * scale.max(0.01));
-                ui.painter().image(
-                    texture.id(),
-                    img,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            }
             if let Some(i) = video.enlarged {
+                // The full-res frame, once it lands, fills the exact rect the
+                // preview did, so the swap only sharpens the picture.
+                let preview = video.frames[i].as_ref();
+                let full = video.full.get(&i);
+                if let Some(size) = preview.or(full).map(|t| t.size_vec2()) {
+                    let scale = (rect.width() / size.x).min((rect.height() - 20.0) / size.y);
+                    let img = egui::Rect::from_center_size(rect.center(), size * scale.max(0.01));
+                    if let Some(texture) = full.or(preview) {
+                        ui.painter().image(
+                            texture.id(),
+                            img,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+                let res = match full {
+                    Some(t) => format!("   {}x{}", t.size()[0], t.size()[1]),
+                    None if video.full_pending.contains(&i) => "   loading full res".to_string(),
+                    None => String::new(),
+                };
                 ui.painter().text(
                     rect.left_bottom() + egui::vec2(4.0, -4.0),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("frame {}/{expected} @ {:.1} s   ←/→ step, Esc back", i + 1, video.frame_time(i)),
+                    format!(
+                        "frame {}/{expected} @ {:.1} s{res}   ←/→ step, Esc back",
+                        i + 1,
+                        video.frame_time(i)
+                    ),
                     egui::FontId::proportional(13.0),
                     ui.visuals().text_color(),
                 );
             }
+            self.request_full_frames(ctx);
             return;
         }
 
@@ -1979,9 +2338,39 @@ impl GeeqApp {
             let resp = resp.on_hover_text(format!("frame {} @ {:.1} s", i + 1, t));
             if resp.clicked() && video.frames[i].is_some() {
                 video.enlarged = Some(i);
+                self.request_full_frames(ctx);
             }
         }
-        let _ = ctx;
+    }
+
+    /// Pulls the enlarged frame at full resolution in the background, then
+    /// its neighbours so Left/Right land on sharp frames too. Copies more
+    /// than one step away are dropped to bound memory on 4K+ video.
+    fn request_full_frames(&mut self, ctx: &egui::Context) {
+        let Some(video) = &mut self.video else { return };
+        let Some(i) = video.enlarged else { return };
+        let n = video.expected().max(1);
+        let near = |j: usize| {
+            let d = (j + n - i) % n;
+            d <= 1 || d == n - 1
+        };
+        video.full.retain(|&j, _| near(j));
+        let max_side = ctx.input(|inp| inp.max_texture_side);
+        for j in [i, (i + 1) % n, (i + n - 1) % n] {
+            if video.full.contains_key(&j) || !video.full_pending.insert(j) {
+                continue;
+            }
+            let (gen, path, secs) = (self.generation, video.path.clone(), video.frame_time(j));
+            let (tx, current) = (self.video_tx.clone(), Arc::clone(&self.video_gen));
+            thread::spawn(move || {
+                if current.load(Ordering::Relaxed) != gen {
+                    return;
+                }
+                if let Ok(frame) = video_frame_full(&path, secs, max_side) {
+                    let _ = tx.send(VideoMsg::Full(gen, j, frame));
+                }
+            });
+        }
     }
 
     /// Wheel over the viewer steps through the folder: down = next, up =
@@ -2094,23 +2483,6 @@ impl GeeqApp {
 /// the pure-Rust decoder in the `image` crate; everything else falls back to
 /// `image::open`.
 fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
-    let is_jpeg = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_ascii_lowercase();
-            e == "jpg" || e == "jpeg"
-        })
-        .unwrap_or(false);
-
-    if is_jpeg {
-        let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        match turbojpeg::decompress_image::<image::Rgba<u8>>(&bytes) {
-            Ok(rgba) => return Ok(rgba),
-            Err(_) => { /* fall through to the generic decoder below */ }
-        }
-    }
-
     if is_raw_file(path) {
         // The embedded full-size preview when the file has one (fast, and
         // the camera's own rendering), otherwise a developed raw.
@@ -2123,9 +2495,18 @@ fn decode_to_rgba(path: &Path) -> Result<image::RgbaImage, String> {
         return render_pdf_pages(path, PDF_PREVIEW_HEIGHT);
     }
 
-    image::open(path)
-        .map(|img| img.to_rgba8())
-        .map_err(|e| e.to_string())
+    // The format comes from the file's first bytes, not its name, so a
+    // JPEG saved as .webp (Snapseed does this) still opens.
+    let reader = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())?;
+    if reader.format() == Some(image::ImageFormat::Jpeg) {
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        if let Ok(rgba) = turbojpeg::decompress_image::<image::Rgba<u8>>(&bytes) {
+            return Ok(rgba);
+        }
+    }
+    reader.decode().map(|img| img.to_rgba8()).map_err(|e| e.to_string())
 }
 
 /// A PDF's document info from poppler's `pdfinfo`, laid out like EXIF: the
@@ -2198,14 +2579,16 @@ fn render_pdf_pages(path: &Path, height: u32) -> Result<image::RgbaImage, String
 }
 
 /// The frames of an animated GIF or WebP, composited to the full canvas.
-/// None for other formats and for still WebPs.
+/// None for other formats and for still WebPs. Goes by the file's
+/// contents, like `decode_to_rgba`, not its extension.
 fn anim_frames(path: &Path) -> Option<image::Frames<'static>> {
-    use image::AnimationDecoder;
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    let file = std::io::BufReader::new(fs::File::open(path).ok()?);
-    match ext.as_str() {
-        "gif" => Some(image::codecs::gif::GifDecoder::new(file).ok()?.into_frames()),
-        "webp" => {
+    use image::{AnimationDecoder, ImageFormat};
+    let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let format = reader.format()?;
+    let file = reader.into_inner();
+    match format {
+        ImageFormat::Gif => Some(image::codecs::gif::GifDecoder::new(file).ok()?.into_frames()),
+        ImageFormat::WebP => {
             let decoder = image::codecs::webp::WebPDecoder::new(file).ok()?;
             decoder.has_animation().then(|| decoder.into_frames())
         }
@@ -2452,6 +2835,20 @@ fn read_exif(path: &Path) -> ExifInfo {
 
 impl eframe::App for GeeqApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.kgallery_at_start {
+            self.kgallery_at_start = false;
+            self.open_kgallery(ctx);
+        }
+        if let Some(gallery) = self.kgallery.as_mut() {
+            let mut outcome = kgallery::Outcome::Open;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Color32::BLACK))
+                .show(ctx, |ui| outcome = gallery.ui(ui));
+            if matches!(outcome, kgallery::Outcome::Closed) {
+                self.kgallery = None;
+            }
+            return;
+        }
         if self.radial.is_some()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
@@ -2460,6 +2857,7 @@ impl eframe::App for GeeqApp {
         }
         self.handle_nav_keys(ctx);
         self.drain_load_messages(ctx);
+        self.drain_pull();
         self.tick_animation(ctx);
 
         if !ctx.wants_keyboard_input() {
@@ -2473,6 +2871,9 @@ impl eframe::App for GeeqApp {
             if !self.slideshow && ctx.input(|i| i.key_pressed(egui::Key::S)) {
                 self.start_slideshow(ctx);
             }
+            if ctx.input(|i| i.key_pressed(egui::Key::K)) {
+                self.open_kgallery(ctx);
+            }
             if !self.slideshow && ctx.input(|i| i.key_pressed(egui::Key::G)) {
                 self.grid_mode = !self.grid_mode;
                 self.grid_scroll_pending = true;
@@ -2480,15 +2881,17 @@ impl eframe::App for GeeqApp {
             if self.grid_mode && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.grid_mode = false;
             }
+            // Number keys toggle looks in filter mode, numbered tags otherwise.
             if self.filter_mode {
-                const DIGITS: [egui::Key; 9] = [
-                    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
-                    egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
-                    egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
-                ];
-                for (i, key) in DIGITS.iter().enumerate() {
+                for (i, key) in DIGIT_KEYS.iter().enumerate() {
                     if ctx.input(|inp| inp.key_pressed(*key)) {
                         self.toggle_look(i);
+                    }
+                }
+            } else if let Some(path) = self.selected_file.clone() {
+                for (i, key) in DIGIT_KEYS.iter().enumerate() {
+                    if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, *key)) {
+                        self.toggle_tag(ctx, i, path.clone());
                     }
                 }
             }
@@ -2567,6 +2970,60 @@ impl eframe::App for GeeqApp {
                         });
                     });
                 });
+        }
+
+        // The numbered tags: one row per tag in use, to put its list on the
+        // clipboard again, pull its raws off the card, or clear it.
+        if self.tags.iter().any(|t| !t.is_empty()) || !self.tag_status.is_empty() {
+            let mut action: Option<(usize, TagAction)> = None;
+            egui::Window::new("tags_popup")
+                .title_bar(false)
+                .resizable(false)
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
+                .frame(egui::Frame::popup(&ctx.style()).fill(Color32::from_black_alpha(210)))
+                .show(ctx, |ui| {
+                    ui.set_max_width(380.0);
+                    for (i, list) in self.tags.iter().enumerate().filter(|(_, l)| !l.is_empty()) {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Tag {} ({})", i + 1, list.len()));
+                            if ui.small_button("Copy").on_hover_text("Put this list on the clipboard").clicked() {
+                                action = Some((i, TagAction::Copy));
+                            }
+                            let idle = self.tag_pull.is_none();
+                            if ui
+                                .add_enabled(idle, egui::Button::new("Pull RAW").small())
+                                .on_hover_text("Copy the raw of each of these photos from the camera card to beside the photo")
+                                .clicked()
+                            {
+                                action = Some((i, TagAction::Pull));
+                            }
+                            if ui.small_button("Clear").clicked() {
+                                action = Some((i, TagAction::Clear));
+                            }
+                        });
+                    }
+                    if let Some(pull) = &self.tag_pull {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Pulling tag {}: {}/{}", pull.tag + 1, pull.done, pull.total));
+                        });
+                    }
+                    if !self.tag_status.is_empty() {
+                        ui.horizontal_top(|ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(&self.tag_status).small()).wrap());
+                            if ui.small_button("✕").clicked() {
+                                action = Some((0, TagAction::Dismiss));
+                            }
+                        });
+                    }
+                });
+            match action {
+                Some((i, TagAction::Copy)) => ctx.copy_text(self.tag_text(i)),
+                Some((i, TagAction::Pull)) => self.start_pull(ctx, i),
+                Some((i, TagAction::Clear)) => self.clear_tag(i),
+                Some((_, TagAction::Dismiss)) => self.tag_status.clear(),
+                None => {}
+            }
         }
 
         // Directory-wide displays (phase plot, sharpness histogram) span the
@@ -2859,6 +3316,18 @@ impl eframe::App for GeeqApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("Files ({})", self.files.len()));
                     self.video_menu(ui);
+                    let pdf = Self::shown_menu(ui, "📄 PDF", &mut self.show_pdfs, SHOW_PDFS_FILE);
+                    let raw = Self::shown_menu(ui, "📷 Raw", &mut self.show_raws, SHOW_RAWS_FILE);
+                    if pdf || raw {
+                        self.apply_type_filter();
+                    }
+                    if ui
+                        .button(format!("⇅ {}", self.sort_by.label()))
+                        .on_hover_text("Sort files: name → time (newest first) → size (largest first)")
+                        .clicked()
+                    {
+                        self.cycle_sort();
+                    }
                 });
 
                 // File list. Right-click a row to add/remove its path in the
@@ -2881,6 +3350,10 @@ impl eframe::App for GeeqApp {
                                         format!("📋 {name}")
                                     } else {
                                         name
+                                    };
+                                    let label = match self.tag_marks.get(&file) {
+                                        Some(marks) => format!("{marks} {label}"),
+                                        None => label,
                                     };
                                     let is_selected = self.selected_index == Some(idx);
                                     let resp = ui
@@ -3042,6 +3515,7 @@ enum RadialAction {
     Info,
     Plots,
     Video,
+    Sort,
     Grid,
     Filters,
     Slideshow,
@@ -3094,6 +3568,12 @@ impl GeeqApp {
                 format!("🎬\n{video}"),
                 self.video_mode || self.video_listing != VideoListing::Hide,
                 "Video mode: hide → list → load previews → videos only",
+            ),
+            (
+                RadialAction::Sort,
+                format!("⇅\n{}", self.sort_by.label()),
+                self.sort_by != SortBy::Name,
+                "Sort files: name → time → size",
             ),
             (RadialAction::Grid, "▦\nGrid".to_string(), self.grid_mode, "Thumbnail grid (G)"),
             (RadialAction::Filters, "✨\nFilters".to_string(), self.filter_mode, "Live looks filters (F); pick looks in Options"),
@@ -3163,6 +3643,10 @@ impl GeeqApp {
                     save_video_listing(next);
                 }
                 self.apply_video_settings();
+                return true;
+            }
+            RadialAction::Sort => {
+                self.cycle_sort();
                 return true;
             }
             RadialAction::Grid => {
@@ -3611,8 +4095,18 @@ impl GeeqApp {
                         area = area.scroll_offset(egui::Vec2::ZERO);
                     }
                     area.show(ui, |ui| {
-                        ui.set_min_size(avail);
-                        ui.centered_and_justified(add_image);
+                        // Reserve max(picture, viewport) from the scroll
+                        // origin and center the picture inside it by hand.
+                        // A centered layout would centre an over-wide
+                        // picture on the viewport instead, pushing half of
+                        // the overflow left of the origin where no scroll
+                        // offset can reach it ("can't move left" when
+                        // zoomed). This also matches the padding assumed by
+                        // `zoom_center_fraction`.
+                        let region = egui::vec2(screen_size.x.max(avail.x), screen_size.y.max(avail.y));
+                        let (region_rect, _) = ui.allocate_exact_size(region, egui::Sense::hover());
+                        let picture_rect = egui::Rect::from_center_size(region_rect.center(), alloc_size);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(picture_rect), add_image);
                     });
 
                     if let Some(exif) = &loaded.exif {
@@ -3715,6 +4209,9 @@ impl GeeqApp {
         }
         if self.clip_stack.contains(&loaded.path) {
             text += "   📋";
+        }
+        if let Some(marks) = self.tag_marks.get(&loaded.path) {
+            text += &format!("   {marks}");
         }
         if self.filter_mode {
             let names: Vec<&str> = self
@@ -4084,6 +4581,18 @@ mod gif_tests {
         assert!(img.width() > 0 && img.height() > 0);
         let exif = read_exif(path);
         eprintln!("exif camera: {:?}, key fields: {}", exif.camera, exif.key.len());
+    }
+
+    #[test]
+    fn decodes_by_contents_not_extension() {
+        // Snapseed saves JPEGs with a .webp name.
+        let path = std::env::temp_dir().join("geeq-test-jpeg-named.webp");
+        image::RgbImage::from_pixel(8, 6, image::Rgb([200, 10, 10]))
+            .save_with_format(&path, image::ImageFormat::Jpeg)
+            .unwrap();
+        let img = decode_to_rgba(&path).unwrap();
+        assert_eq!((img.width(), img.height()), (8, 6));
+        assert!(anim_frames(&path).is_none());
     }
 
     #[test]
