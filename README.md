@@ -31,6 +31,8 @@ clicking. `C`, Options or Full in the radial menu switches to the full UI
 
 Video mode: add `--video` (or `-V`) to either command.
 
+The Files panel header has dropdowns next to the file count: 🎬 Video (hide / list / load previews / videos only), 📄 PDF (show / hide), 📷 Raw (show / hide), and ⇅ sort, which cycles name (A→Z) → time (newest first) → size (largest first) on each click; Sort in the radial menu does the same. Folders always list by name. The sort is saved in `~/.config/geeq/sort.txt`; PDF and Raw settings are saved in `~/.config/geeq/show_pdfs.txt` and `show_raws.txt`.
+
 kgallery: press `K` (or start with `--kgallery`) to play the videos of the folder together in a looping NxN grid (needs libmpv). The videos are picked at random from the whole folder: the order is shuffled each time kgallery opens, and paging through the grid shows every video once. `Left`/`Right` change page (the next and previous pages are preloaded), `+`/`-` change the grid size (columns x rows, up to 8x6, not always square), `Space` pauses, `F11` is fullscreen, `Esc`/`Q` returns. `GEEQ_HWDEC` overrides mpv's hardware decoding (default `auto-safe`).
 
 kgallery grid: `--nn 5` (or `--nn=5`) makes it a square 5x5 grid (1 to 6). Without it the grid is picked from the number of videos.
