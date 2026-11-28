@@ -13,6 +13,37 @@ use std::thread;
 
 mod kgallery;
 mod looks;
+mod rawpull;
+
+/// Number keys 1-9: numbered tags, or looks while filter mode is on.
+const DIGIT_KEYS: [egui::Key; 9] = [
+    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+    egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
+    egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+];
+const TAG_COUNT: usize = DIGIT_KEYS.len();
+
+/// Messages from a running raw pull back to the UI thread.
+enum PullEvent {
+    Progress(usize),
+    Done(rawpull::Summary),
+}
+
+/// A background copy of one tag's raws off the camera card.
+struct TagPull {
+    tag: usize,
+    total: usize,
+    done: usize,
+    rx: mpsc::Receiver<PullEvent>,
+}
+
+/// What a button in the tags popup asked for.
+enum TagAction {
+    Copy,
+    Pull,
+    Clear,
+    Dismiss,
+}
 
 fn config_file(name: &str) -> Option<PathBuf> {
     let config_home = std::env::var("XDG_CONFIG_HOME")
@@ -32,6 +63,18 @@ fn looks_path_file() -> Option<PathBuf> {
     config_file("looks_path.txt")
 }
 
+
+/// Optional: the camera card's mount point (or its DCIM folder), for when
+/// it should not be searched for under /run/media and /media.
+fn card_root_file() -> Option<PathBuf> {
+    config_file("card_root.txt")
+}
+
+fn load_card_root() -> Option<PathBuf> {
+    let text = fs::read_to_string(card_root_file()?).ok()?;
+    let line = text.trim();
+    (!line.is_empty()).then(|| PathBuf::from(line))
+}
 
 /// Whether geeq opens in the thumbnail grid instead of the single-image view.
 fn start_in_grid_file() -> Option<PathBuf> {
@@ -558,6 +601,14 @@ struct GeeqApp {
     /// touch the file on disk.
     rotation: u8,
     clip_stack: Vec<PathBuf>,
+    /// Numbered tags 1-9 (index 0-8): the files carrying each one, in the
+    /// order they were tagged.
+    tags: [Vec<PathBuf>; TAG_COUNT],
+    /// Per tagged file, its tags as "[1,3]", for the lists and the caption.
+    tag_marks: HashMap<PathBuf, String>,
+    /// The raw pull in flight, and the outcome line of the last one.
+    tag_pull: Option<TagPull>,
+    tag_status: String,
     /// Looks exported from snaplite, and the live filter mode that applies
     /// them to whatever image is shown.
     looks_lib: Vec<looks::Look>,
@@ -733,6 +784,10 @@ impl GeeqApp {
             wheel_accum: 0.0,
             rotation: 0,
             clip_stack: Vec::new(),
+            tags: Default::default(),
+            tag_marks: HashMap::new(),
+            tag_pull: None,
+            tag_status: String::new(),
             looks_lib: Vec::new(),
             looks_path: None,
             looks_error: None,
@@ -1084,6 +1139,102 @@ impl GeeqApp {
         self.record_activity();
     }
 
+    /// A tag's files, shell-quoted and space-separated like the clip stack.
+    fn tag_text(&self, tag: usize) -> String {
+        self.tags[tag].iter().map(|p| shell_quote(p)).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Number key `tag` (0-8) on a photo: toggles the tag and, like the
+    /// clip stack, puts the tag's whole list on the clipboard.
+    fn toggle_tag(&mut self, ctx: &egui::Context, tag: usize, path: PathBuf) {
+        let list = &mut self.tags[tag];
+        match list.iter().position(|p| *p == path) {
+            Some(pos) => {
+                list.remove(pos);
+            }
+            None => list.push(path),
+        }
+        self.rebuild_tag_marks();
+        ctx.copy_text(self.tag_text(tag));
+        self.record_activity();
+    }
+
+    fn clear_tag(&mut self, tag: usize) {
+        self.tags[tag].clear();
+        self.rebuild_tag_marks();
+    }
+
+    fn rebuild_tag_marks(&mut self) {
+        let mut numbers: HashMap<&PathBuf, Vec<String>> = HashMap::new();
+        for (i, list) in self.tags.iter().enumerate() {
+            for path in list {
+                numbers.entry(path).or_default().push((i + 1).to_string());
+            }
+        }
+        self.tag_marks = numbers
+            .into_iter()
+            .map(|(path, nums)| (path.clone(), format!("[{}]", nums.join(","))))
+            .collect();
+    }
+
+    /// Copies the raws of every file in tag `tag` from the camera card to
+    /// next to each file, on a background thread.
+    fn start_pull(&mut self, ctx: &egui::Context, tag: usize) {
+        if self.tag_pull.is_some() || self.tags[tag].is_empty() {
+            return;
+        }
+        let dcims = rawpull::card_dcims(load_card_root().as_deref());
+        if dcims.is_empty() {
+            self.tag_status = "No camera card found: mount the card (it needs a DCIM folder), or put its path in ~/.config/geeq/card_root.txt".to_string();
+            return;
+        }
+        let files = self.tags[tag].clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let total = files.len();
+        thread::spawn(move || {
+            let mut index = rawpull::CardIndex::new(dcims);
+            let summary = rawpull::pull(&files, &mut index, |done| {
+                let _ = tx.send(PullEvent::Progress(done));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(PullEvent::Done(summary));
+            ctx.request_repaint();
+        });
+        self.tag_status.clear();
+        self.tag_pull = Some(TagPull { tag, total, done: 0, rx });
+    }
+
+    /// Picks up progress and the final summary of a running raw pull.
+    fn drain_pull(&mut self) {
+        let Some(pull) = self.tag_pull.as_mut() else { return };
+        let tag = pull.tag;
+        let mut summary = None;
+        let mut lost = false;
+        loop {
+            match pull.rx.try_recv() {
+                Ok(PullEvent::Progress(done)) => pull.done = done,
+                Ok(PullEvent::Done(s)) => summary = Some(s),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    lost = summary.is_none();
+                    break;
+                }
+            }
+        }
+        if let Some(summary) = summary {
+            self.tag_status = summary.describe(tag + 1);
+            self.tag_pull = None;
+            if summary.copied > 0 {
+                // The new raws sit next to their photos: list them.
+                self.rescan_dir();
+            }
+        } else if lost {
+            self.tag_status = format!("Tag {}: the pull stopped unexpectedly", tag + 1);
+            self.tag_pull = None;
+        }
+    }
+
     /// Kicks off a background thumbnail decode for the clip-stack popup,
     /// unless one's already cached or in flight for this path.
     fn ensure_thumbnail(&mut self, path: PathBuf) {
@@ -1149,8 +1300,14 @@ impl GeeqApp {
         self.error = None;
 
         if let Some(entry) = self.clip_stack.iter_mut().find(|p| **p == file) {
-            *entry = dest;
+            *entry = dest.clone();
             ctx.copy_text(self.clip_stack_text());
+        }
+        if self.tag_marks.contains_key(&file) {
+            for entry in self.tags.iter_mut().flatten().filter(|p| **p == file) {
+                *entry = dest.clone();
+            }
+            self.rebuild_tag_marks();
         }
         self.exposure_points.retain(|p| p.path != file);
         self.sharpness_points.retain(|p| p.path != file);
@@ -1829,6 +1986,10 @@ impl GeeqApp {
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
                         let name = if self.clip_stack.contains(&path) { format!("📋 {name}") } else { name };
+                        let name = match self.tag_marks.get(&path) {
+                            Some(marks) => format!("{marks} {name}"),
+                            None => name,
+                        };
                         let label_rect = egui::Rect::from_min_max(
                             egui::pos2(rect.min.x + 4.0, rect.max.y - GRID_LABEL_H),
                             egui::pos2(rect.max.x - 4.0, rect.max.y),
@@ -2568,6 +2729,7 @@ impl eframe::App for GeeqApp {
         }
         self.handle_nav_keys(ctx);
         self.drain_load_messages(ctx);
+        self.drain_pull();
         self.tick_animation(ctx);
 
         if !ctx.wants_keyboard_input() {
@@ -2591,15 +2753,17 @@ impl eframe::App for GeeqApp {
             if self.grid_mode && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.grid_mode = false;
             }
+            // Number keys toggle looks in filter mode, numbered tags otherwise.
             if self.filter_mode {
-                const DIGITS: [egui::Key; 9] = [
-                    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
-                    egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
-                    egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
-                ];
-                for (i, key) in DIGITS.iter().enumerate() {
+                for (i, key) in DIGIT_KEYS.iter().enumerate() {
                     if ctx.input(|inp| inp.key_pressed(*key)) {
                         self.toggle_look(i);
+                    }
+                }
+            } else if let Some(path) = self.selected_file.clone() {
+                for (i, key) in DIGIT_KEYS.iter().enumerate() {
+                    if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, *key)) {
+                        self.toggle_tag(ctx, i, path.clone());
                     }
                 }
             }
@@ -2678,6 +2842,60 @@ impl eframe::App for GeeqApp {
                         });
                     });
                 });
+        }
+
+        // The numbered tags: one row per tag in use, to put its list on the
+        // clipboard again, pull its raws off the card, or clear it.
+        if self.tags.iter().any(|t| !t.is_empty()) || !self.tag_status.is_empty() {
+            let mut action: Option<(usize, TagAction)> = None;
+            egui::Window::new("tags_popup")
+                .title_bar(false)
+                .resizable(false)
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
+                .frame(egui::Frame::popup(&ctx.style()).fill(Color32::from_black_alpha(210)))
+                .show(ctx, |ui| {
+                    ui.set_max_width(380.0);
+                    for (i, list) in self.tags.iter().enumerate().filter(|(_, l)| !l.is_empty()) {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Tag {} ({})", i + 1, list.len()));
+                            if ui.small_button("Copy").on_hover_text("Put this list on the clipboard").clicked() {
+                                action = Some((i, TagAction::Copy));
+                            }
+                            let idle = self.tag_pull.is_none();
+                            if ui
+                                .add_enabled(idle, egui::Button::new("Pull RAW").small())
+                                .on_hover_text("Copy the raw of each of these photos from the camera card to beside the photo")
+                                .clicked()
+                            {
+                                action = Some((i, TagAction::Pull));
+                            }
+                            if ui.small_button("Clear").clicked() {
+                                action = Some((i, TagAction::Clear));
+                            }
+                        });
+                    }
+                    if let Some(pull) = &self.tag_pull {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Pulling tag {}: {}/{}", pull.tag + 1, pull.done, pull.total));
+                        });
+                    }
+                    if !self.tag_status.is_empty() {
+                        ui.horizontal_top(|ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(&self.tag_status).small()).wrap());
+                            if ui.small_button("✕").clicked() {
+                                action = Some((0, TagAction::Dismiss));
+                            }
+                        });
+                    }
+                });
+            match action {
+                Some((i, TagAction::Copy)) => ctx.copy_text(self.tag_text(i)),
+                Some((i, TagAction::Pull)) => self.start_pull(ctx, i),
+                Some((i, TagAction::Clear)) => self.clear_tag(i),
+                Some((_, TagAction::Dismiss)) => self.tag_status.clear(),
+                None => {}
+            }
         }
 
         // Directory-wide displays (phase plot, sharpness histogram) span the
@@ -2992,6 +3210,10 @@ impl eframe::App for GeeqApp {
                                         format!("📋 {name}")
                                     } else {
                                         name
+                                    };
+                                    let label = match self.tag_marks.get(&file) {
+                                        Some(marks) => format!("{marks} {label}"),
+                                        None => label,
                                     };
                                     let is_selected = self.selected_index == Some(idx);
                                     let resp = ui
@@ -3836,6 +4058,9 @@ impl GeeqApp {
         }
         if self.clip_stack.contains(&loaded.path) {
             text += "   📋";
+        }
+        if let Some(marks) = self.tag_marks.get(&loaded.path) {
+            text += &format!("   {marks}");
         }
         if self.filter_mode {
             let names: Vec<&str> = self
