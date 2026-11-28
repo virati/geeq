@@ -31,7 +31,7 @@ clicking. `C`, Options or Full in the radial menu switches to the full UI
 
 Video mode: add `--video` (or `-V`) to either command.
 
-kgallery: press `K` (or start with `--kgallery`) to play every video of the folder together in a looping NxN grid (needs libmpv). `Left`/`Right` change page (the next and previous pages are preloaded), `+`/`-` change the grid size (columns x rows, up to 8x6, not always square), `Space` pauses, `F11` is fullscreen, `Esc`/`Q` returns. `GEEQ_HWDEC` overrides mpv's hardware decoding (default `auto-safe`).
+kgallery: press `K` (or start with `--kgallery`) to play the videos of the folder together in a looping NxN grid (needs libmpv). The videos are picked at random from the whole folder: the order is shuffled each time kgallery opens, and paging through the grid shows every video once. `Left`/`Right` change page (the next and previous pages are preloaded), `+`/`-` change the grid size (columns x rows, up to 8x6, not always square), `Space` pauses, `F11` is fullscreen, `Esc`/`Q` returns. `GEEQ_HWDEC` overrides mpv's hardware decoding (default `auto-safe`).
 
 kgallery grid: `--nn 5` (or `--nn=5`) makes it a square 5x5 grid (1 to 6). Without it the grid is picked from the number of videos.
 

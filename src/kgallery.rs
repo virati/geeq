@@ -1,5 +1,7 @@
 //! kgallery: every video of a folder, playing together in an NxN grid.
 //!
+//! * The videos are shuffled when the gallery opens, so each page is a random
+//!   pick from the whole folder (a pass over the pages still shows each once).
 //! * One libmpv instance per tile, rendered into its own FBO texture inside
 //!   an egui glow paint callback, then blitted into the tile's rectangle.
 //! * Every tile loops its own video. The demuxer keeps the clip in memory
@@ -59,12 +61,24 @@ const DEFAULT_AUDIO_DEVICE: &str = "pulse/alsa_output.pci-0000_01_00.1.hdmi-ster
 static SHUFFLE: AtomicBool = AtomicBool::new(false);
 static SEED: AtomicU64 = AtomicU64::new(0);
 
-/// Random start position, 0..90 percent of the clip (splitmix64).
-fn random_percent() -> u32 {
+/// Next random number (splitmix64).
+fn random_u64() -> u64 {
     let mut z = SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed).wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    ((z ^ (z >> 31)) % 90) as u32
+    z ^ (z >> 31)
+}
+
+/// Random start position, 0..90 percent of the clip.
+fn random_percent() -> u32 {
+    (random_u64() % 90) as u32
+}
+
+/// Fisher-Yates: every order of `items` is equally likely.
+fn shuffle<T>(items: &mut [T]) {
+    for i in (1..items.len()).rev() {
+        items.swap(i, (random_u64() % (i as u64 + 1)) as usize);
+    }
 }
 
 mod ffi {
@@ -553,13 +567,15 @@ pub struct KGallery {
 
 impl KGallery {
     /// None when the folder has no videos.
-    pub fn new(ctx: &egui::Context, dir: PathBuf, files: Vec<PathBuf>) -> Option<Self> {
+    pub fn new(ctx: &egui::Context, dir: PathBuf, mut files: Vec<PathBuf>) -> Option<Self> {
         if files.is_empty() {
             return None;
         }
         SHUFFLE.store(std::env::args().any(|a| a == "--shuffle"), Ordering::Relaxed);
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
         SEED.store(nanos, Ordering::Relaxed);
+        // Each page is a random pick from all the videos of the folder; a pass over the pages shows each once.
+        shuffle(&mut files);
         // `--nn 5` (or `--nn=5`): a square NxN grid.
         let args: Vec<String> = std::env::args().collect();
         let nn = args.iter().enumerate().find_map(|(i, a)| match a.strip_prefix("--nn=") {
